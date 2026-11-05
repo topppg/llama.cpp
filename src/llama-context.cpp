@@ -2922,6 +2922,11 @@ uint32_t llama_context::graph_max_nodes() const {
         res += 32u*model.hparams.n_layer_all;
     }
 
+    // page-sparse decode adds the page statistics and the page selection to every attention layer
+    if (getenv("LLAMA_SPARSE_PAGES") || getenv("LLAMA_SPARSE_PAGE_STATS")) {
+        res += 128u*model.hparams.n_layer();
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;

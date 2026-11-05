@@ -680,6 +680,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (logit_softcap != 0.0f && Q->ne[0] != 128 && Q->ne[0] != 256) {
             return BEST_FATTN_KERNEL_NONE;
         }
+        // page-sparse decode: the chunked gather exists only in the vector kernel
+        const bool vec_ok = Q->ne[1] == 1 && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+            K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[2] % mask->ne[2] == 0 && dst->src[5] == nullptr;
+        if (vec_ok) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
     }
 
     // only the MMA kernel reads K/V through kv_rows
