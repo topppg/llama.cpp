@@ -2543,6 +2543,12 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Promise that, in every mask row, each 32-aligned chunk of 32 cells with a finite entry has a finite first entry.
+    // With n_kv_max > 0, backends may then gather whole chunks instead of single cells.
+    GGML_API void ggml_flash_attn_ext_set_mask_chunked(
+            struct ggml_tensor * a,
+            bool                 chunked);
+
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
     // n_kv_max must bound the number of finite entries in every mask row.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(

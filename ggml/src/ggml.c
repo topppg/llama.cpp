@@ -5673,6 +5673,14 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_mask_chunked(
+        struct ggml_tensor * a,
+        bool                 chunked) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    ggml_set_op_params_i32(a, 5, chunked ? 32 : 0);
+}
+
 void ggml_flash_attn_ext_set_n_kv_max(
         struct ggml_tensor * a,
         int32_t              n_kv_max) {

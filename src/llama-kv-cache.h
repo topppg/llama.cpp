@@ -279,7 +279,7 @@ private:
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
 
-        // page statistics for page-sparse decode (LLAMA_SPARSE_PAGE_STATS): [mean, var, max, min] of K per page of 64 cells
+        // page statistics for page-sparse decode (LLAMA_SPARSE_DECODE_STATS): [mean, var, max, min] of K per page of 64 cells
         ggml_tensor * ps = nullptr; // [4*n_embd_head_k, n_head_kv, kv_size/64]
     };
 

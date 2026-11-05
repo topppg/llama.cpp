@@ -386,7 +386,7 @@ public:
     llm_attn_mask self_attn_mask;
 
 
-    // page-sparse decode (LLAMA_SPARSE_PAGES): eligible pages, page member cells, sink + window cells
+    // page-sparse decode (LLAMA_SPARSE_DECODE): eligible pages, page member cells, sink + window cells
     ggml_tensor * sp_page_mask = nullptr; // F32 [n_page]
     ggml_tensor * sp_blocks    = nullptr; // I32 [64, n_page]
     ggml_tensor * sp_extra     = nullptr; // I32 [64 + 128, n_batch/n_stream, n_head, 1]
@@ -1361,7 +1361,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // page-sparse decode (LLAMA_SPARSE_PAGES): the sparse mask and the FA n_kv_max
+    // page-sparse decode (LLAMA_SPARSE_DECODE): the sparse mask and the FA n_kv_max
     std::pair<ggml_tensor *, int64_t> build_sparse_pages(
             llm_graph_input_attn_kv * inp,
                     ggml_tensor * q,

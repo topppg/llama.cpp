@@ -559,9 +559,9 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     bool paged = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (cols_per_block == 1 && !use_logit_softcap) {
-        static const bool sparse_paged = getenv("GGML_CUDA_FA_SPARSE_PAGED") && atoi(getenv("GGML_CUDA_FA_SPARSE_PAGED")) == 1;
         const ggml_tensor * mask = dst->src[3];
-        paged = sparse_paged && mask && ggml_get_op_params_i32(dst, 4) > 0 && dst->src[0]->ne[1] == 1 && dst->src[1]->ne[1] % FATTN_PAGED_CHUNK == 0;
+        paged = mask && ggml_get_op_params_i32(dst, 5) == FATTN_PAGED_CHUNK && ggml_get_op_params_i32(dst, 4) > 0 &&
+            dst->src[0]->ne[1] == 1 && dst->src[1]->ne[1] % FATTN_PAGED_CHUNK == 0;
         if (paged) {
             fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
         }

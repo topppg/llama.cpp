@@ -625,23 +625,25 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// LLAMA_SPARSE_PAGES=<B>: single-token decode attends to page 0, the window and the top (B - 80)/64 pages of 64 cells per KV head
-// LLAMA_SPARSE_SCORE=mv|quest|mean: page score (default mv), read at every graph build
+// page-sparse decode (experimental), read at every graph build:
+//   LLAMA_SPARSE_DECODE=<B>             single-token decode attends to about B cells: page 0, the recent window
+//                                       and the top (B - 80)/64 pages of 64 cells per KV head
+//   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
+//   LLAMA_SPARSE_DECODE_SCORE=mv|quest  page score (default mv)
 static int llama_sparse_pages_budget() {
-    const char * e = getenv("LLAMA_SPARSE_PAGES");
+    const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
-    GGML_ASSERT((b == 0 || b >= 144) && "LLAMA_SPARSE_PAGES must be 0 or >= 144");
+    GGML_ASSERT((b == 0 || b >= 144) && "LLAMA_SPARSE_DECODE must be 0 or >= 144");
     return b;
 }
 
-// LLAMA_SPARSE_MIN_CTX=<n>: only cache lengths of at least n cells use the sparse path (default 0)
 static int64_t llama_sparse_pages_min_ctx() {
-    const char * e = getenv("LLAMA_SPARSE_MIN_CTX");
-    return e ? atoll(e) : 0;
+    const char * e = getenv("LLAMA_SPARSE_DECODE_MIN_CTX");
+    return e ? atoll(e) : 32768;
 }
 
 static int llama_sparse_pages_score() {
-    const char * e = getenv("LLAMA_SPARSE_SCORE");
+    const char * e = getenv("LLAMA_SPARSE_DECODE_SCORE");
     if (!e || strcmp(e, "mv") == 0) {
         return 0;
     }
@@ -651,7 +653,7 @@ static int llama_sparse_pages_score() {
     if (strcmp(e, "mean") == 0) {
         return 2;
     }
-    GGML_ABORT("LLAMA_SPARSE_SCORE must be mv, quest or mean");
+    GGML_ABORT("LLAMA_SPARSE_DECODE_SCORE must be mv, quest or mean");
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -678,7 +680,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
         for (int64_t c = 0; c < self_attn_mask.raw->ne[0]; ++c) {
             if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= c0)) {
-                GGML_ABORT("LLAMA_SPARSE_PAGE_STATS needs one sequence whose cell index equals its position");
+                GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
             }
         }
         std::vector<int32_t> pages;
@@ -706,7 +708,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
         for (int64_t c = 0; c < n_kv; ++c) {
             if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= pos)) {
-                GGML_ABORT("LLAMA_SPARSE_PAGES needs one sequence whose cell index equals its position");
+                GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
             }
         }
 
@@ -3162,6 +3164,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        // one mask per head with an n_kv_max only comes from page-sparse decode, whose masks are whole 64-cell pages
+        ggml_flash_attn_ext_set_mask_chunked(cur, n_kv_max > 0 && kq_mask && kq_mask->ne[2] > 1);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
