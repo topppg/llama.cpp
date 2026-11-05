@@ -1,5 +1,5 @@
 // sparse-tail: dense prefill of T - n_tail tokens, then n_tail teacher-forced single-token decode steps per config,
-// KL(dense || config) of the next-token distribution per row. Configs set LLAMA_SPARSE_PAGES / LLAMA_SPARSE_SCORE.
+// KL(dense || config) of the next-token distribution per row. Configs set LLAMA_SPARSE_DECODE / LLAMA_SPARSE_DECODE_SCORE.
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -215,11 +215,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the tool compares configs at any cache length
+    setenv("LLAMA_SPARSE_DECODE_MIN_CTX", "0", 0);
+
     // set while the context is created so the graph budget covers the sparse ops
     for (auto & c : configs) {
         if (c.budget > 0) {
-            setenv("LLAMA_SPARSE_PAGES", std::to_string(c.budget).c_str(), 1);
-            setenv("LLAMA_SPARSE_SCORE", c.score.c_str(), 1);
+            setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
+            setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
             break;
         }
     }
@@ -247,7 +250,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
     llama_memory_t mem = llama_get_memory(ctx);
-    unsetenv("LLAMA_SPARSE_PAGES");
+    unsetenv("LLAMA_SPARSE_DECODE");
 
     FILE * out = out_path.empty() ? stdout : fopen(out_path.c_str(), "w");
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
@@ -266,7 +269,7 @@ int main(int argc, char ** argv) {
         const gen_prompt & gp = prompts[pi];
         const int Pt = (int) gp.ids.size() - 1;
 
-        unsetenv("LLAMA_SPARSE_PAGES");
+        unsetenv("LLAMA_SPARSE_DECODE");
         llama_memory_clear(mem, true);
         const int64_t t0 = ggml_time_us();
         for (int i = 0; i < Pt; i += cp.n_batch) {
@@ -283,10 +286,10 @@ int main(int argc, char ** argv) {
 
         for (const auto & c : configs) {
             if (c.budget > 0) {
-                setenv("LLAMA_SPARSE_PAGES", std::to_string(c.budget).c_str(), 1);
-                setenv("LLAMA_SPARSE_SCORE", c.score.c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
             } else {
-                unsetenv("LLAMA_SPARSE_PAGES");
+                unsetenv("LLAMA_SPARSE_DECODE");
             }
             llama_memory_seq_rm(mem, 0, Pt, -1);
 
@@ -323,7 +326,7 @@ int main(int argc, char ** argv) {
         const int L  = (int) tr.ids.size();
         const int Pt = L - 1 - tr.n_ans;
 
-        unsetenv("LLAMA_SPARSE_PAGES");
+        unsetenv("LLAMA_SPARSE_DECODE");
         llama_memory_clear(mem, true);
         const int64_t t0 = ggml_time_us();
         for (int i = 0; i < Pt; i += cp.n_batch) {
@@ -340,10 +343,10 @@ int main(int argc, char ** argv) {
 
         for (const auto & c : configs) {
             if (c.budget > 0) {
-                setenv("LLAMA_SPARSE_PAGES", std::to_string(c.budget).c_str(), 1);
-                setenv("LLAMA_SPARSE_SCORE", c.score.c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
             } else {
-                unsetenv("LLAMA_SPARSE_PAGES");
+                unsetenv("LLAMA_SPARSE_DECODE");
             }
             llama_memory_seq_rm(mem, 0, Pt, -1);
 
@@ -384,7 +387,7 @@ int main(int argc, char ** argv) {
     for (int b = 0; ret_path.empty() && gen_path.empty() && b < n_books; ++b) {
         const int32_t * toks = all.data() + (size_t) b*book_len;
 
-        unsetenv("LLAMA_SPARSE_PAGES");
+        unsetenv("LLAMA_SPARSE_DECODE");
         llama_memory_clear(mem, true);
         const int64_t t0 = ggml_time_us();
         for (int i = 0; i < P; i += cp.n_batch) {
@@ -407,10 +410,10 @@ int main(int argc, char ** argv) {
         for (size_t ci = 0; ci < configs.size(); ++ci) {
             const auto & c = configs[ci];
             if (c.budget > 0) {
-                setenv("LLAMA_SPARSE_PAGES", std::to_string(c.budget).c_str(), 1);
-                setenv("LLAMA_SPARSE_SCORE", c.score.c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
+                setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
             } else {
-                unsetenv("LLAMA_SPARSE_PAGES");
+                unsetenv("LLAMA_SPARSE_DECODE");
             }
             llama_memory_seq_rm(mem, 0, P, -1);
 
