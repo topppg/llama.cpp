@@ -2923,7 +2923,7 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     // page-sparse decode adds the page statistics and the page selection to every attention layer
-    if (getenv("LLAMA_SPARSE_PAGES") || getenv("LLAMA_SPARSE_PAGE_STATS")) {
+    if (getenv("LLAMA_SPARSE_DECODE")) {
         res += 128u*model.hparams.n_layer();
     }
 
