@@ -385,6 +385,16 @@ public:
 
     llm_attn_mask self_attn_mask;
 
+
+    // page-sparse decode (LLAMA_SPARSE_PAGES): eligible pages, page member cells, sink + window cells
+    ggml_tensor * sp_page_mask = nullptr; // F32 [n_page]
+    ggml_tensor * sp_blocks    = nullptr; // I32 [64, n_page]
+    ggml_tensor * sp_extra     = nullptr; // I32 [64 + 128, n_batch/n_stream, n_head, 1]
+    ggml_tensor * sp_upd       = nullptr; // I32 [n_batch/64 + 2] pages whose statistics are refreshed
+    ggml_tensor * sp_upd64     = nullptr; // I64 same
+    int           sp_budget    = 0;
+    int           sp_score     = 0;
+
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;
     std::vector<ggml_tensor *> self_v_rot;
@@ -1350,6 +1360,23 @@ struct llm_graph_context {
             ggml_tensor * top_k, // [n_indexer_top_k, n_tokens]
                   float   kq_scale,
                     int   il) const;
+
+    // page-sparse decode (LLAMA_SPARSE_PAGES): the sparse mask and the FA n_kv_max
+    std::pair<ggml_tensor *, int64_t> build_sparse_pages(
+            llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q,
+                    ggml_tensor * k,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * ps,
+                          float   kq_scale,
+                            int   il) const;
+
+    // refresh the cached statistics of the pages in inp->sp_upd from the K cache, returns the updated statistics
+    ggml_tensor * build_page_stats(
+            llm_graph_input_attn_kv * inp,
+                    ggml_tensor * k,
+                    ggml_tensor * ps,
+                            int   il) const;
 
     // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
     ggml_tensor * build_fused_top_k_mask(

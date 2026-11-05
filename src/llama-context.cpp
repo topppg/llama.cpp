@@ -2757,6 +2757,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+        // page-sparse decode adds the page statistics and the page selection to every attention layer
+        if (getenv("LLAMA_SPARSE_PAGES") || getenv("LLAMA_SPARSE_PAGE_STATS")) {
+            res += 128u*model.hparams.n_layer();
+        }
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

@@ -16,7 +16,8 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+// paged: KV_max holds, per (sequence, q head), the count and the list of visible 32-cell chunks (page-sparse decode)
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool paged = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -112,7 +113,7 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + (ne32 > 1 ? nb32*(head % ne32) : 0) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -249,13 +250,26 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
-             // Increment pointers after each loop:
-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+    static_assert(!paged || (nthreads == nwarps*WARP_SIZE && WARP_SIZE == FATTN_PAGED_CHUNK), "paged mode needs one chunk per warp");
+
+    const int k_VKQ_max = paged ? 0 : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    const int   n_chunks_vis = paged ? KV_max[sequence*ne02 + head] : 0;
+    const int * chunks       = paged ? KV_max + ne02*ne03 + int64_t(sequence*ne02 + head)*(ne11/FATTN_PAGED_CHUNK) : nullptr;
+    const char * K_base     = K;
+    const char * V_base     = V;
+    const half * maskh_base = maskh;
+    for (int it = blockIdx.y; paged ? it*nwarps < n_chunks_vis : it*nthreads < k_VKQ_max; it += gridDim.y) {
+        // pointers are set so that key i_KQ of this warp maps to its chunk; chunks past the list are padded with -inf
+        int   k_VKQ_0 = it*nthreads;
+        float KQ_pad  = 0.0f;
+        if constexpr (paged) {
+            const int ci = it*nwarps + threadIdx.y;
+            KQ_pad  = ci < n_chunks_vis ? 0.0f : -INFINITY;
+            k_VKQ_0 = chunks[ci < n_chunks_vis ? ci : 0]*FATTN_PAGED_CHUNK - threadIdx.y*WARP_SIZE;
+        }
+        K     = K_base     + int64_t(k_VKQ_0)*nb11;
+        V     = V_base     + int64_t(k_VKQ_0)*nb21;
+        maskh = maskh_base + k_VKQ_0;
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -281,6 +295,9 @@ static __global__ void flash_attn_ext_vec(
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                }
+                if constexpr (paged) {
+                    sum += KQ_pad;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -539,10 +556,21 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    bool paged = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (cols_per_block == 1 && !use_logit_softcap) {
+        static const bool sparse_paged = getenv("GGML_CUDA_FA_SPARSE_PAGED") && atoi(getenv("GGML_CUDA_FA_SPARSE_PAGED")) == 1;
+        const ggml_tensor * mask = dst->src[3];
+        paged = sparse_paged && mask && ggml_get_op_params_i32(dst, 4) > 0 && dst->src[0]->ne[1] == 1 && dst->src[1]->ne[1] % FATTN_PAGED_CHUNK == 0;
+        if (paged) {
+            fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, paged);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

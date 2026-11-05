@@ -207,6 +207,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // page statistics of layer il, nullptr when not allocated
+    ggml_tensor * get_ps(int32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -275,6 +278,9 @@ private:
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+
+        // page statistics for page-sparse decode (LLAMA_SPARSE_PAGE_STATS): [mean, var, max, min] of K per page of 64 cells
+        ggml_tensor * ps = nullptr; // [4*n_embd_head_k, n_head_kv, kv_size/64]
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -419,6 +425,9 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // page statistics of layer il, nullptr when not allocated
+    ggml_tensor * get_ps(int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

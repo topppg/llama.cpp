@@ -727,6 +727,65 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+#define FATTN_PAGED_CHUNK 32
+
+// page-sparse decode: per (sequence, q head) mask row, the ordered list of visible chunks of FATTN_PAGED_CHUNK cells.
+// A chunk counts as visible iff its first cell is, so the mask has to be chunk-aligned (page blocks, sink, window up to pos).
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_chunks(
+        const half * mask_ptr, int * counts, int * lists, const int n_chunks, const int ne02, const int ne32, const int ne33,
+        const int64_t s32, const int64_t s33) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(mask_ptr, counts, lists, n_chunks, ne02, ne32, ne33, s32, s33);
+    NO_DEVICE_CODE;
+#else
+    constexpr int nwarps = 256/WARP_SIZE;
+
+    const int list     = blockIdx.x;
+    const int sequence = list / ne02;
+    const int head     = list - sequence*ne02;
+    const int lane     = threadIdx.x % WARP_SIZE;
+    const int warp     = threadIdx.x / WARP_SIZE;
+
+    const half * mask = mask_ptr + (sequence % ne33)*s33 + (head % ne32)*s32;
+    int        * out  = lists + int64_t(list)*n_chunks;
+
+    __shared__ int warp_counts[nwarps];
+
+    ggml_cuda_pdl_sync();
+
+    int base = 0;
+    for (int c0 = 0; c0 < n_chunks; c0 += 256) {
+        const int  c   = c0 + threadIdx.x;
+        const bool vis = c < n_chunks && !isinf(__half2float(mask[int64_t(c)*FATTN_PAGED_CHUNK]));
+
+        const unsigned ballot = __ballot_sync(0xFFFFFFFF, vis);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(ballot);
+        }
+        __syncthreads();
+
+        int off = 0;
+        int tot = 0;
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            const int n = warp_counts[w];
+            off += w < warp ? n : 0;
+            tot += n;
+        }
+        if (vis) {
+            out[base + off + __popc(ballot & ((1u << lane) - 1u))] = c;
+        }
+        base += tot;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        counts[list] = base;
+    }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -982,7 +1041,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const bool paged = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1117,10 +1176,30 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 
+    // paged (vector kernel, one query): KV_max = [counts of the n_head*n_seq lists | lists of n_kv/FATTN_PAGED_CHUNK chunks each]
+    int64_t n_kv_paged = 0;
+    if (paged) {
+        GGML_ASSERT(!use_sparse && !stream_k && !kv_rows && mask != nullptr && ncols1 == 1 && Q->ne[1] == 1);
+        GGML_ASSERT(K->ne[1] % FATTN_PAGED_CHUNK == 0 && mask->ne[0] == K->ne[1]);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_paged = std::min<int64_t>(K->ne[1], n_kv_max_query);
+
+        const int n_lists  = Q->ne[2]*Q->ne[3];
+        const int n_chunks = K->ne[1]/FATTN_PAGED_CHUNK;
+        KV_max.alloc(size_t(n_lists) + size_t(n_lists)*n_chunks);
+
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(n_lists, 1, 1), dim3(256, 1, 1), 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_chunks, launch_params,
+            (const half *) mask->data, KV_max.ptr, KV_max.ptr + n_lists, n_chunks, int(Q->ne[2]), int(mask->ne[2]), int(mask->ne[3]),
+            int64_t(mask->nb[2]/sizeof(half)), int64_t(mask->nb[3]/sizeof(half)));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    const bool scan_mask = !use_sparse && !paged && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1151,7 +1230,7 @@ void launch_fattn(
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : n_kv_cols;
-    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int ntiles_KV = ((paged ? n_kv_paged : n_kv) + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {

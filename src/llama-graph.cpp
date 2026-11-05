@@ -625,6 +625,35 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// LLAMA_SPARSE_PAGES=<B>: single-token decode attends to page 0, the window and the top (B - 80)/64 pages of 64 cells per KV head
+// LLAMA_SPARSE_SCORE=mv|quest|mean: page score (default mv), read at every graph build
+static int llama_sparse_pages_budget() {
+    const char * e = getenv("LLAMA_SPARSE_PAGES");
+    const int b = e ? atoi(e) : 0;
+    GGML_ASSERT((b == 0 || b >= 144) && "LLAMA_SPARSE_PAGES must be 0 or >= 144");
+    return b;
+}
+
+// LLAMA_SPARSE_MIN_CTX=<n>: only cache lengths of at least n cells use the sparse path (default 0)
+static int64_t llama_sparse_pages_min_ctx() {
+    const char * e = getenv("LLAMA_SPARSE_MIN_CTX");
+    return e ? atoll(e) : 0;
+}
+
+static int llama_sparse_pages_score() {
+    const char * e = getenv("LLAMA_SPARSE_SCORE");
+    if (!e || strcmp(e, "mv") == 0) {
+        return 0;
+    }
+    if (strcmp(e, "quest") == 0) {
+        return 1;
+    }
+    if (strcmp(e, "mean") == 0) {
+        return 2;
+    }
+    GGML_ABORT("LLAMA_SPARSE_SCORE must be mv, quest or mean");
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -639,6 +668,77 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    if (sp_upd && sp_upd->buffer) {
+        // pages completed by this ubatch, and the page that becomes eligible at its last position
+        const int64_t c0 = ubatch->pos[0];
+        const int64_t c1 = ubatch->pos[ubatch->n_tokens - 1] + 1;
+        GGML_ASSERT(c1 - c0 == ubatch->n_tokens);
+        GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
+        const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
+        for (int64_t c = 0; c < self_attn_mask.raw->ne[0]; ++c) {
+            if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= c0)) {
+                GGML_ABORT("LLAMA_SPARSE_PAGE_STATS needs one sequence whose cell index equals its position");
+            }
+        }
+        std::vector<int32_t> pages;
+        for (int64_t p = std::max<int64_t>(0, (c0 + 63)/64 - 1); 64*p + 63 < c1; ++p) {
+            if (64*p + 63 >= c0) {
+                pages.push_back((int32_t) p);
+            }
+        }
+        pages.push_back((int32_t) std::max<int64_t>(0, (c1 - 1 - 63)/64 - 1));
+        const int64_t n_upd = sp_upd->ne[0];
+        GGML_ASSERT((int64_t) pages.size() <= n_upd);
+        pages.resize(n_upd, pages.back());
+        std::vector<int64_t> pages64(pages.begin(), pages.end());
+        ggml_backend_tensor_set(sp_upd,   pages.data(),   0, ggml_nbytes(sp_upd));
+        ggml_backend_tensor_set(sp_upd64, pages64.data(), 0, ggml_nbytes(sp_upd64));
+    }
+
+    if (sp_page_mask && sp_page_mask->buffer) {
+        GGML_ASSERT(ubatch->n_tokens == 1);
+        const int64_t pos  = ubatch->pos[0];
+        const int64_t n_kv = self_attn_mask.raw->ne[0];
+
+        // the page rule indexes cells by position: check that cell c is visible exactly when c <= pos
+        GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
+        const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
+        for (int64_t c = 0; c < n_kv; ++c) {
+            if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= pos)) {
+                GGML_ABORT("LLAMA_SPARSE_PAGES needs one sequence whose cell index equals its position");
+            }
+        }
+
+        const int64_t n_page  = sp_page_mask->ne[0];
+        const int64_t win_blk = std::max<int64_t>(0, (pos - 63)/64);
+
+        std::vector<float> pm(n_page);
+        for (int64_t p = 0; p < n_page; ++p) {
+            pm[p] = p >= 1 && p < win_blk ? 0.0f : -1e30f;
+        }
+        ggml_backend_tensor_set(sp_page_mask, pm.data(), 0, ggml_nbytes(sp_page_mask));
+
+        std::vector<int32_t> blk(64*n_page);
+        for (int64_t c = 0; c < 64*n_page; ++c) {
+            blk[c] = (int32_t) c;
+        }
+        ggml_backend_tensor_set(sp_blocks, blk.data(), 0, ggml_nbytes(sp_blocks));
+
+        const int64_t n_extra = sp_extra->ne[0];
+        std::vector<int32_t> ex(ggml_nelements(sp_extra), -1);
+        for (int64_t r = 0; r < ggml_nrows(sp_extra); ++r) {
+            int32_t * row = ex.data() + r*n_extra;
+            int64_t j = 0;
+            for (int64_t c = 0; c < 64; ++c) {
+                row[j++] = (int32_t) c;
+            }
+            for (int64_t c = std::max<int64_t>(64, win_blk*64); c <= pos && j < n_extra; ++c) {
+                row[j++] = (int32_t) c;
+            }
+        }
+        ggml_backend_tensor_set(sp_extra, ex.data(), 0, ggml_nbytes(sp_extra));
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -652,6 +752,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
+
+    res &= sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score();
 
     return res;
 }
@@ -3328,7 +3430,24 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * mask     = kq_mask;
+    int64_t       n_kv_max = 0;
+
+    inp->sp_budget = llama_sparse_pages_budget();
+    inp->sp_score  = llama_sparse_pages_score();
+
+    ggml_tensor * ps = nullptr;
+    if (mctx_cur->get_ps(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
+        ps = build_page_stats(inp, k, mctx_cur->get_ps(il), il);
+    }
+
+    // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size
+    if (inp->sp_budget > 0 && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && mask->type == GGML_TYPE_F16 &&
+            k->ne[3] == 1 && k->ne[2] % 64 == 0 && k->ne[2] >= llama_sparse_pages_min_ctx()) {
+        std::tie(mask, n_kv_max) = build_sparse_pages(inp, q, k, mask, ps, kq_scale, il);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot[il]) {
@@ -3442,6 +3561,158 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_page_stats(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k,
+        ggml_tensor * ps,
+                int   il) const {
+    const int64_t d      = k->ne[0];
+    const int64_t n_kv_h = k->ne[1];
+    const int64_t n_kv   = k->ne[2];
+
+    if (!inp->sp_upd) {
+        inp->sp_upd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens/64 + 2);
+        ggml_set_input(inp->sp_upd);
+        ggml_set_name(inp->sp_upd, "sp_upd");
+
+        inp->sp_upd64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens/64 + 2);
+        ggml_set_input(inp->sp_upd64);
+        ggml_set_name(inp->sp_upd64, "sp_upd64");
+    }
+    const int64_t n_upd = inp->sp_upd->ne[0];
+
+    // the 64 cells of each refreshed page, from the cache
+    ggml_tensor * rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, k, d*n_kv_h*64, n_kv/64), inp->sp_upd); // f32 [d*n_kv_h*64, n_upd]
+    rows = ggml_reshape_4d(ctx0, rows, d, n_kv_h, 64, n_upd);
+    rows = ggml_cont(ctx0, ggml_permute(ctx0, rows, 1, 2, 0, 3));          // [64, d, n_kv_h, n_upd]
+
+    ggml_tensor * mu  = ggml_mean(ctx0, rows);
+    ggml_tensor * var = ggml_mean(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, rows, mu)));
+    ggml_tensor * r2  = ggml_reshape_2d(ctx0, rows, 64, d*n_kv_h*n_upd);
+    ggml_tensor * mx  = ggml_pool_1d(ctx0, r2, GGML_OP_POOL_MAX, 64, 64, 0);
+    ggml_tensor * mn  = ggml_neg(ctx0, ggml_pool_1d(ctx0, ggml_neg(ctx0, r2), GGML_OP_POOL_MAX, 64, 64, 0));
+
+    auto head_major = [&](ggml_tensor * t) { return ggml_reshape_3d(ctx0, t, d, n_kv_h, n_upd); };
+    ggml_tensor * st = ggml_concat(ctx0,
+            ggml_concat(ctx0, head_major(mu), head_major(var), 0),
+            ggml_concat(ctx0, head_major(mx), head_major(mn), 0), 0);          // [4d, n_kv_h, n_upd]
+    st = ggml_reshape_2d(ctx0, st, 4*d*n_kv_h, n_upd);
+
+    ggml_tensor * out = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, ps, 4*d*n_kv_h, ps->ne[2]), st, inp->sp_upd64);
+    cb(out, "sp_ps", il);
+    ggml_build_forward_expand(gf, out);
+
+    return ggml_reshape_3d(ctx0, out, 4*d, n_kv_h, ps->ne[2]);
+}
+
+std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * kq_mask,
+        ggml_tensor * ps,
+              float   kq_scale,
+                int   il) const {
+    const int64_t d      = k->ne[0];
+    const int64_t n_kv_h = k->ne[1];
+    const int64_t n_kv   = k->ne[2];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_gqa  = n_head/n_kv_h;
+    const int64_t n_page = n_kv/64;
+    const int64_t n_top  = std::min<int64_t>(n_page, (inp->sp_budget - 80)/64);
+
+    if (!inp->sp_page_mask) {
+        inp->sp_page_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_page);
+        ggml_set_input(inp->sp_page_mask);
+        ggml_set_name(inp->sp_page_mask, "sp_page_mask");
+
+        inp->sp_blocks = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 64, n_page);
+        ggml_set_input(inp->sp_blocks);
+        ggml_set_name(inp->sp_blocks, "sp_blocks");
+
+        inp->sp_extra = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 64 + 128, kq_mask->ne[1], n_head, 1);
+        ggml_set_input(inp->sp_extra);
+        ggml_set_name(inp->sp_extra, "sp_extra");
+    }
+
+    // without cached statistics they are recomputed from the whole cache
+    ggml_tensor * kf = nullptr;
+    if (!ps) {
+        kf = ggml_cast(ctx0, k, GGML_TYPE_F32);                               // [d, n_kv_h, n_kv]
+        cb(kf, "sp_k", il);
+        kf = ggml_reshape_4d(ctx0, kf, d, n_kv_h, 64, n_page);
+        kf = ggml_cont(ctx0, ggml_permute(ctx0, kf, 1, 2, 0, 3));           // [64, d, n_kv_h, n_page]
+    }
+
+    // cached statistics [mean, var, max, min] viewed as [n, n_page, n_kv_h]
+    auto cached = [&](int64_t off, int64_t n) {
+        const size_t ts = ggml_element_size(ps);
+        return ggml_view_3d(ctx0, ps, n, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, off*ts);
+    };
+
+    // [1, d, n_kv_h, n_page] -> [d, n_page, n_kv_h]
+    auto page_major = [&](ggml_tensor * t) {
+        t = ggml_reshape_3d(ctx0, t, d, n_kv_h, n_page);
+        return ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
+    };
+
+    ggml_tensor * qs = ggml_scale(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), kq_scale);
+    cb(qs, "sp_q", il);
+    qs = ggml_reshape_3d(ctx0, qs, d, n_gqa, n_kv_h);                         // head h = kv*n_gqa + g
+
+    ggml_tensor * stats;
+    ggml_tensor * qcat;
+    if (inp->sp_score == 0) {
+        // mv: s.mu + s^2.var/2
+        if (ps) {
+            stats = cached(0, 2*d);
+        } else {
+            ggml_tensor * mu  = ggml_mean(ctx0, kf);
+            ggml_tensor * var = ggml_mean(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, kf, mu)));
+            stats = ggml_concat(ctx0, page_major(mu), page_major(var), 0);
+        }
+        qcat = ggml_concat(ctx0, qs, ggml_scale(ctx0, ggml_sqr(ctx0, qs), 0.5f), 0);
+    } else if (inp->sp_score == 1) {
+        // quest: s+.max + s-.min
+        if (ps) {
+            stats = cached(2*d, 2*d);
+        } else {
+            ggml_tensor * k2 = ggml_reshape_2d(ctx0, kf, 64, d*n_kv_h*n_page);
+            ggml_tensor * mx = ggml_pool_1d(ctx0, k2, GGML_OP_POOL_MAX, 64, 64, 0);
+            ggml_tensor * mn = ggml_neg(ctx0, ggml_pool_1d(ctx0, ggml_neg(ctx0, k2), GGML_OP_POOL_MAX, 64, 64, 0));
+            stats = ggml_concat(ctx0, page_major(mx), page_major(mn), 0);
+        }
+        qcat = ggml_concat(ctx0, ggml_relu(ctx0, qs), ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, qs))), 0);
+    } else {
+        stats = ps ? cached(0, d) : page_major(ggml_mean(ctx0, kf));
+        qcat  = qs;
+    }
+    cb(stats, "sp_stats", il);
+
+    ggml_tensor * score = ggml_mul_mat(ctx0, stats, qcat);                   // [n_page, n_gqa, n_kv_h]
+    score = ggml_add(ctx0, score, inp->sp_page_mask);
+
+    // per-head log-softmax over the eligible pages, then max over the heads of the group
+    score = ggml_sub(ctx0, score, ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, n_page, n_page, 0));
+    score = ggml_sub(ctx0, score, ggml_log(ctx0, ggml_sum_rows(ctx0, ggml_exp(ctx0, score))));
+    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));          // [n_gqa, n_page, n_kv_h]
+    score = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, score, n_gqa, n_page*n_kv_h), GGML_OP_POOL_MAX, n_gqa, n_gqa, 0);
+    score = ggml_reshape_3d(ctx0, score, n_page, 1, n_kv_h);
+    cb(score, "sp_gscore", il);
+
+    ggml_tensor * picks = ggml_top_k(ctx0, score, n_top);                    // [n_top, 1, n_kv_h]
+    cb(picks, "sp_picks", il);
+    picks = ggml_reshape_4d(ctx0, picks, n_top, 1, 1, n_kv_h);
+    picks = ggml_repeat_4d(ctx0, picks, n_top, kq_mask->ne[1], n_gqa, n_kv_h);
+    picks = ggml_reshape_4d(ctx0, picks, n_top, kq_mask->ne[1], n_head, 1);
+
+    ggml_tensor * mask = ggml_top_k_mask(ctx0, kq_mask, picks, nullptr, inp->sp_blocks, inp->sp_extra);
+    cb(mask, "sp_mask", il);
+
+    // page 0, the picks and at most 128 window cells, all aligned to 64
+    return {mask, 64*(n_top + 3)};
 }
 
 ggml_tensor * llm_graph_context::build_fused_top_k_mask(
