@@ -629,7 +629,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //   LLAMA_SPARSE_DECODE=<B>             single-token decode attends to about B cells: page 0, the recent window
 //                                       and the top (B - 80)/64 pages of 64 cells per KV head
 //   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
-//   LLAMA_SPARSE_DECODE_SCORE=mv|quest  page score (default mv)
+//   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest)
 static int llama_sparse_pages_budget() {
     const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
@@ -644,11 +644,11 @@ static int64_t llama_sparse_pages_min_ctx() {
 
 static int llama_sparse_pages_score() {
     const char * e = getenv("LLAMA_SPARSE_DECODE_SCORE");
-    if (!e || strcmp(e, "mv") == 0) {
-        return 0;
-    }
-    if (strcmp(e, "quest") == 0) {
+    if (!e || strcmp(e, "quest") == 0) {
         return 1;
+    }
+    if (strcmp(e, "mv") == 0) {
+        return 0;
     }
     if (strcmp(e, "mean") == 0) {
         return 2;
