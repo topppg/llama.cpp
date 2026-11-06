@@ -3,7 +3,6 @@
 
 #define CUDA_TOP_K_MASK_BLOCK_SIZE 512
 #define CUDA_TOP_K_MASK_FILL_CELLS 4096
-#define CUDA_TOP_K_MASK_ITEM_THREADS 64
 
 // pass 1: fill every row with -inf, many blocks per row
 template <typename T>
@@ -41,7 +40,7 @@ static __global__ void top_k_mask_fill_kernel(T * dst, const int64_t n_kv, const
     }
 }
 
-// pass 2: copy the mask cells of the live picks and the extra cells; a group of threads per pick writes its block's cells
+// pass 2: copy the mask cells of the live picks and the extra cells; a group of tpi threads per pick writes its block's cells
 template <typename T>
 static __global__ void top_k_mask_scatter_kernel(
         const T * mask, const int32_t * top_k, const float * score, const int32_t * blocks, const int32_t * extra, T * dst,
@@ -53,7 +52,7 @@ static __global__ void top_k_mask_scatter_kernel(
         const int64_t sk0, const int64_t sk1, const int64_t sk2, const int64_t sk3,
         const int64_t ss0, const int64_t ss1, const int64_t ss2, const int64_t ss3,
         const int64_t sb0, const int64_t sb1,
-        const int64_t se0, const int64_t se1, const int64_t se2, const int64_t se3) {
+        const int64_t se0, const int64_t se1, const int64_t se2, const int64_t se3, const int tpi) {
     ggml_cuda_pdl_lc();
 
     const int64_t ir = blockIdx.x;
@@ -65,8 +64,8 @@ static __global__ void top_k_mask_scatter_kernel(
     T             * dst_row   = dst   + i1*sd1 + i2*sd2 + i3*sd3;
     const int32_t * top_k_row = top_k + i1*sk1 + i2*sk2 + i3*sk3;
 
-    const int64_t i = (int64_t) blockIdx.y*(blockDim.x/CUDA_TOP_K_MASK_ITEM_THREADS) + threadIdx.x/CUDA_TOP_K_MASK_ITEM_THREADS;
-    const int     t = threadIdx.x % CUDA_TOP_K_MASK_ITEM_THREADS;
+    const int64_t i = (int64_t) blockIdx.y*(blockDim.x/tpi) + threadIdx.x/tpi;
+    const int     t = threadIdx.x % tpi;
 
     ggml_cuda_pdl_sync();
 
@@ -96,7 +95,7 @@ static __global__ void top_k_mask_scatter_kernel(
         }
         return;
     }
-    for (int64_t k = t; k < n_blk; k += CUDA_TOP_K_MASK_ITEM_THREADS) {
+    for (int64_t k = t; k < n_blk; k += tpi) {
         const int32_t c = blocks[k*sb0 + p*sb1];
         if (c >= 0 && c < n_kv) {
             dst_row[c] = mask_row[c];
@@ -135,7 +134,12 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_kernel_launch(top_k_mask_fill_kernel<T>, fill_params, (T *) dst->data, n_kv, dst->ne[1], dst->ne[2],
             dst->nb[1]/sizeof(T), dst->nb[2]/sizeof(T), dst->nb[3]/sizeof(T), vec);
 
-    const int64_t items_per_block = CUDA_TOP_K_MASK_BLOCK_SIZE/CUDA_TOP_K_MASK_ITEM_THREADS;
+    // threads per pick: one per block cell up to 64, so picks of single cells or small blocks do not idle most threads
+    int tpi = 1;
+    while (blocks && tpi < 64 && tpi < blocks->ne[0]) {
+        tpi *= 2;
+    }
+    const int64_t items_per_block = CUDA_TOP_K_MASK_BLOCK_SIZE/tpi;
     const dim3 scatter_grid(n_rows, (n_top + n_extra + items_per_block - 1)/items_per_block, 1);
     const ggml_cuda_kernel_launch_params scatter_params(scatter_grid, dim3(CUDA_TOP_K_MASK_BLOCK_SIZE, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(top_k_mask_scatter_kernel<T>, scatter_params,
@@ -152,7 +156,7 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             top_k->nb[0]/si, top_k->nb[1]/si, top_k->nb[2]/si, top_k->nb[3]/si,
             score  ? score->nb[0]/sf  : 0, score ? score->nb[1]/sf : 0, score ? score->nb[2]/sf : 0, score ? score->nb[3]/sf : 0,
             blocks ? blocks->nb[0]/si : 0, blocks ? blocks->nb[1]/si : 0,
-            extra  ? extra->nb[0]/si  : 0, extra ? extra->nb[1]/si : 0, extra ? extra->nb[2]/si : 0, extra ? extra->nb[3]/si : 0);
+            extra  ? extra->nb[0]/si  : 0, extra ? extra->nb[1]/si : 0, extra ? extra->nb[2]/si : 0, extra ? extra->nb[3]/si : 0, tpi);
 }
 
 void ggml_cuda_op_top_k_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
