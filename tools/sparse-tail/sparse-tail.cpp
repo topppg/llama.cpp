@@ -41,7 +41,7 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * ud) {
         return false;
     }
     const std::string base(name, dash - name);
-    if (base != "sp_q" && base != "sp_stats" && base != "sp_gscore" && base != "sp_picks" && base != "sp_mask" && !(ds->with_k && base == "sp_k")) {
+    if (base != "sp_q" && base != "sp_stats" && base != "sp_gscore" && base != "sp_picks" && base != "sp_picks_ref" && base != "sp_mask" && !(ds->with_k && base == "sp_k")) {
         return false;
     }
     if (!ds->layers.count(atoi(dash + 1))) {
