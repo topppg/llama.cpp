@@ -10,6 +10,7 @@
 #define PAGE_TOP_K_SCORE_WARPS  8
 #define PAGE_TOP_K_SCORE_PAGES  32
 #define PAGE_TOP_K_SELECT_SIZE  1024
+#define PAGE_TOP_K_LSE_PAD(n)   (((n) + 3) & ~3)
 
 template <typename TS>
 static __device__ __forceinline__ float2 page_top_k_load2(const TS * x);
@@ -137,7 +138,7 @@ static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_sele
         const float * sc, float * gs_global, int32_t * dst, const int n_gqa, const int n_page, const int n_top, const int64_t sd1) {
     ggml_cuda_pdl_lc();
 
-    extern __shared__ float smem[]; // lse [n_gqa], then the group scores [n_page] unless gs_global
+    extern __shared__ float smem[]; // lse [n_gqa padded to 4], then the group scores [n_page] unless gs_global
     __shared__ float red_f[PAGE_TOP_K_SELECT_SIZE/WARP_SIZE][PAGE_TOP_K_GQA_CHUNK];
     __shared__ int   red_i[PAGE_TOP_K_SELECT_SIZE/WARP_SIZE];
     __shared__ int   hist[256];
@@ -152,7 +153,8 @@ static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_sele
     const int nw   = nt / WARP_SIZE;
 
     float * lse = smem;
-    float * gs  = gs_global ? gs_global + (int64_t) k*n_page : smem + n_gqa;
+    // the padding keeps the vector loads of lse off the group scores, which other threads write meanwhile
+    float * gs  = gs_global ? gs_global + (int64_t) k*n_page : smem + PAGE_TOP_K_LSE_PAD(n_gqa);
 
     const float * sk = sc + (int64_t) k*n_gqa*n_page;
 
@@ -339,7 +341,7 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int n_gqa  = n_head/n_kv_h;
     const int n_top  = dst->ne[0];
 
-    const bool gs_smem = n_gqa + n_page <= PAGE_TOP_K_SMEM_FLOATS;
+    const bool gs_smem = PAGE_TOP_K_LSE_PAD(n_gqa) + n_page <= PAGE_TOP_K_SMEM_FLOATS;
 
     ggml_cuda_pool_alloc<float> sc(ctx.pool(), (size_t) n_kv_h*n_gqa*n_page);
     ggml_cuda_pool_alloc<float> gs(ctx.pool(), gs_smem ? 1 : (size_t) n_kv_h*n_page);
@@ -353,7 +355,7 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             scale);
 
     const ggml_cuda_kernel_launch_params select_params(dim3(n_kv_h, 1, 1), dim3(PAGE_TOP_K_SELECT_SIZE, 1, 1),
-            (size_t) (n_gqa + (gs_smem ? n_page : 0))*sizeof(float), ctx.stream());
+            (size_t) (PAGE_TOP_K_LSE_PAD(n_gqa) + (gs_smem ? n_page : 0))*sizeof(float), ctx.stream());
     ggml_cuda_kernel_launch(page_top_k_select_kernel, select_params,
             (const float *) sc.get(), gs_smem ? nullptr : gs.get(), (int32_t *) dst->data, n_gqa, n_page, n_top,
             (int64_t) (dst->nb[1]/sizeof(int32_t)));
