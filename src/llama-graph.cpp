@@ -642,7 +642,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //                                       and the top (B - 80)/64 pages of 64 cells per KV head
 //   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
 //   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest)
-//   LLAMA_SPARSE_DECODE_FUSED=0         quest with cached statistics: select with the unfused chain of ops instead of ggml_page_top_k
+//   LLAMA_SPARSE_DECODE_FUSED=0|1|2     quest with cached statistics: 1 (default) selects with ggml_page_top_k, 0 with the unfused
+//                                       chain of ops, 2 with ggml_page_top_k and also computes the unfused picks as sp_picks_ref (debug)
 static int llama_sparse_pages_budget() {
     const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
@@ -655,9 +656,11 @@ static int64_t llama_sparse_pages_min_ctx() {
     return e ? atoll(e) : 32768;
 }
 
-static bool llama_sparse_pages_fused() {
+static int llama_sparse_pages_fused() {
     const char * e = getenv("LLAMA_SPARSE_DECODE_FUSED");
-    return !e || atoi(e) != 0;
+    const int f = e ? atoi(e) : 1;
+    GGML_ASSERT(f >= 0 && f <= 2 && "LLAMA_SPARSE_DECODE_FUSED must be 0, 1 or 2");
+    return f;
 }
 
 static int llama_sparse_pages_score() {
@@ -773,7 +776,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
 
-    res &= sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score();
+    res &= sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused();
 
     return res;
 }
@@ -3494,6 +3497,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     inp->sp_budget = llama_sparse_pages_budget();
     inp->sp_score  = llama_sparse_pages_score();
+    inp->sp_fused  = llama_sparse_pages_fused();
 
     ggml_tensor * ps = nullptr;
     if (mctx_cur->get_ps(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
@@ -3698,7 +3702,9 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     }
 
     // quest with cached statistics: scores, log-softmax, group max and top-k in one op
-    if (ps && inp->sp_score == 1 && llama_sparse_pages_fused()) {
+    const int fused = ps && inp->sp_score == 1 ? inp->sp_fused : 0;
+
+    auto fused_mask = [&]() -> std::pair<ggml_tensor *, int64_t> {
         const size_t  ts    = ggml_element_size(ps);
         ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
         ggml_tensor * q2    = ggml_view_2d(ctx0, q, d, n_head, q->nb[1], 0);
@@ -3715,6 +3721,10 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
         cb(mask, "sp_mask", il);
 
         return {mask, 64*(n_top + 3)};
+    };
+
+    if (fused == 1) {
+        return fused_mask();
     }
 
     // without cached statistics they are recomputed from the whole cache
@@ -3783,6 +3793,13 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     cb(score, "sp_gscore", il);
 
     ggml_tensor * picks = ggml_top_k(ctx0, score, n_top);                    // [n_top, 1, n_kv_h]
+
+    if (fused == 2) {
+        // the unfused picks from the same q and statistics, for comparison only
+        cb(picks, "sp_picks_ref", il);
+        ggml_build_forward_expand(gf, picks);
+        return fused_mask();
+    }
     cb(picks, "sp_picks", il);
     picks = ggml_reshape_4d(ctx0, picks, n_top, 1, 1, n_kv_h);
     picks = ggml_repeat_4d(ctx0, picks, n_top, kq_mask->ne[1], n_gqa, n_kv_h);

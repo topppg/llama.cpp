@@ -9865,6 +9865,12 @@ struct test_page_top_k : public test_case {
         return 0.0;
     }
 
+    // no atomics on the result: every run on a backend gives the same bytes
+    bool deterministic(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return true;
+    }
+
     test_page_top_k(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4, int64_t n_gqa = 8, int64_t n_page = 2048,
             int64_t n_top = 430, int64_t n_masked = 3)
         : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked) {}
@@ -10847,6 +10853,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 4096, 4000, 200));
         test_cases.emplace_back(new test_page_top_k(type, 128, 2, 6, 8192, 2000, 1));
         test_cases.emplace_back(new test_page_top_k(type, 96, 3, 2, 37, 10, 30));
+        // groups larger than one pass of the score kernel, MQA, group scores in global memory, wide heads
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 24, 2048, 430, 3));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 1, 64, 1500, 300, 2));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 10300, 100, 1));
+        test_cases.emplace_back(new test_page_top_k(type, 512, 2, 4, 1024, 200, 3));
     }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
