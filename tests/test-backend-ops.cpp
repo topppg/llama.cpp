@@ -9855,13 +9855,17 @@ struct test_page_top_k : public test_case {
     const int64_t n_gqa;
     const int64_t n_page;
     const int64_t n_top;
-    const int64_t n_masked; // pages with a -inf mask: page 0 and the last n_masked - 1
+    const int64_t n_masked; // masked pages: page 0 and the last n_masked - 1
+    const float   mval;     // their mask value: -inf, or -1e30 as llama-graph sets it
+
+    ggml_tensor * qkv_t = nullptr;
+    ggml_tensor * ps_t  = nullptr;
+    ggml_tensor * pm_t  = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR7(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked);
+        return VARS_TO_STR8(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked, mval);
     }
 
-    // page indices, both backends sort them
     double max_err() override {
         return 0.0;
     }
@@ -9872,25 +9876,114 @@ struct test_page_top_k : public test_case {
         return true;
     }
 
+    // The backends round the scores differently (summation order, exp/log), so two pages whose group scores
+    // are within rounding of the cut may swap. Each row must hold n_top distinct pages, the rows of a group
+    // must be equal, and a page in one result but not the other must lie within 1e-4 of the cut of the
+    // group scores computed here in double precision.
+    double err(const float * a, const float * b, size_t n) override {
+        const int64_t n_head = n_kv_h*n_gqa;
+        GGML_ASSERT(n == (size_t) (n_top*n_head));
+
+        std::vector<float> qkv(ggml_nelements(qkv_t));
+        ggml_backend_tensor_get(qkv_t, qkv.data(), 0, ggml_nbytes(qkv_t));
+        std::vector<float> pm(n_page);
+        ggml_backend_tensor_get(pm_t, pm.data(), 0, ggml_nbytes(pm_t));
+        std::vector<float> ps(ggml_nelements(ps_t));
+        if (type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> h(ps.size());
+            ggml_backend_tensor_get(ps_t, h.data(), 0, ggml_nbytes(ps_t));
+            for (size_t i = 0; i < h.size(); ++i) {
+                ps[i] = ggml_fp16_to_fp32(h[i]);
+            }
+        } else {
+            ggml_backend_tensor_get(ps_t, ps.data(), 0, ggml_nbytes(ps_t));
+        }
+
+        const double scale = 1.0/sqrt((double) d);
+        double diff = 0.0;
+        std::vector<double> g(n_page), s(n_page);
+        for (int64_t k = 0; k < n_kv_h; ++k) {
+            std::fill(g.begin(), g.end(), -INFINITY);
+            for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+                double m = -INFINITY;
+                for (int64_t p = 0; p < n_page; ++p) {
+                    const float * st = ps.data() + (p*n_kv_h + k)*4*d + 2*d;
+                    double acc = 0.0;
+                    for (int64_t j = 0; j < d; ++j) {
+                        const double x = scale*qkv[h*(d + 2) + j];
+                        acc += x > 0.0 ? x*st[j] : x*st[d + j];
+                    }
+                    s[p] = acc + pm[p];
+                    m = std::max(m, s[p]);
+                }
+                double lse = 0.0;
+                if (m > -INFINITY) {
+                    double sum = 0.0;
+                    for (int64_t p = 0; p < n_page; ++p) {
+                        sum += exp(s[p] - m);
+                    }
+                    lse = m + log(sum);
+                }
+                for (int64_t p = 0; p < n_page; ++p) {
+                    g[p] = std::max(g[p], s[p] - lse);
+                }
+            }
+            std::vector<double> sorted(g);
+            std::nth_element(sorted.begin(), sorted.begin() + (n_top - 1), sorted.end(), std::greater<double>());
+            const double cut = sorted[n_top - 1];
+
+            std::set<int32_t> ref_a, ref_b;
+            for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+                std::set<int32_t> sa, sb;
+                for (int64_t i = 0; i < n_top; ++i) {
+                    sa.insert((int32_t) a[h*n_top + i]);
+                    sb.insert((int32_t) b[h*n_top + i]);
+                }
+                if ((int64_t) sa.size() != n_top || (int64_t) sb.size() != n_top ||
+                        *sa.begin() < 0 || *sb.begin() < 0 || *sa.rbegin() >= n_page || *sb.rbegin() >= n_page) {
+                    diff += 1;
+                    continue;
+                }
+                if (h == k*n_gqa) {
+                    ref_a = sa;
+                    ref_b = sb;
+                } else if (sa != ref_a || sb != ref_b) {
+                    diff += 1;
+                }
+            }
+            for (int32_t p : ref_a) {
+                if (!ref_b.count(p) && !(fabs(g[p] - cut) <= 1e-4*(1.0 + fabs(cut)))) {
+                    diff += 1;
+                }
+            }
+            for (int32_t p : ref_b) {
+                if (!ref_a.count(p) && !(fabs(g[p] - cut) <= 1e-4*(1.0 + fabs(cut)))) {
+                    diff += 1;
+                }
+            }
+        }
+        return diff;
+    }
+
     test_page_top_k(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4, int64_t n_gqa = 8, int64_t n_page = 2048,
-            int64_t n_top = 430, int64_t n_masked = 3)
-        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked) {}
+            int64_t n_top = 430, int64_t n_masked = 3, float mval = -INFINITY)
+        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked), mval(mval) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // q is a view with a row stride, as after the split of a fused QKV; stats is the max/min half of the cached statistics
-        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_kv_h*n_gqa + 2*d*n_kv_h, 1);
-        ggml_set_name(qkv, "qkv");
-        ggml_tensor * q = ggml_view_2d(ctx, qkv, d, n_kv_h*n_gqa, d*sizeof(float), 0);
+        // q rows with a stride of d + 2 floats; stats is the max/min half of the cached statistics [mean, var, max, min]
+        qkv_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d + 2)*n_kv_h*n_gqa);
+        ggml_set_name(qkv_t, "qkv");
+        ggml_tensor * q = ggml_view_2d(ctx, qkv_t, d, n_kv_h*n_gqa, (d + 2)*sizeof(float), 0);
 
-        ggml_tensor * ps = ggml_new_tensor_3d(ctx, type, 4*d, n_kv_h, n_page);
-        ggml_set_name(ps, "ps");
+        ps_t = ggml_new_tensor_3d(ctx, type, 4*d, n_kv_h, n_page);
+        ggml_set_name(ps_t, "ps");
         const size_t ts = ggml_type_size(type);
-        ggml_tensor * stats = ggml_view_3d(ctx, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+        ggml_tensor * stats = ggml_view_3d(ctx, ps_t, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
 
-        ggml_tensor * pmask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_page);
-        ggml_set_name(pmask, "pmask");
+        pm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_page);
+        ggml_set_name(pm_t, "pmask");
 
-        ggml_tensor * out = ggml_page_top_k(ctx, q, stats, pmask, n_top, 1.0f/sqrtf((float) d));
+        ggml_tensor * out = ggml_page_top_k(ctx, q, stats, pm_t, n_top, 1.0f/sqrtf((float) d));
         ggml_set_name(out, "out");
 
         return out;
@@ -9901,7 +9994,7 @@ struct test_page_top_k : public test_case {
             if (strcmp(t->name, "pmask") == 0) {
                 std::vector<float> m(n_page, 0.0f);
                 for (int64_t p = 0; p < n_masked; ++p) {
-                    m[p == 0 ? 0 : n_page - p] = -INFINITY;
+                    m[p == 0 ? 0 : n_page - p] = mval;
                 }
                 ggml_backend_tensor_set(t, m.data(), 0, n_page*sizeof(float));
             } else if (strcmp(t->name, "qkv") == 0) {
@@ -10860,6 +10953,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4));
         test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 10300, 100, 1));
         test_cases.emplace_back(new test_page_top_k(type, 512, 2, 4, 1024, 200, 3));
+        // the -1e30 mask of llama-graph, including more picks than unmasked pages
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 4, 256, 250, 20, -1e30f));
     }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
