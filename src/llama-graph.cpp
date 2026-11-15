@@ -668,6 +668,13 @@ static int llama_sparse_pages_score() {
     GGML_ABORT("LLAMA_SPARSE_DECODE_SCORE must be mv, quest or mean");
 }
 
+// profiling only, LLAMA_SPARSE_DECODE_DRY=<s>: compute the selection up to stage s and attend densely
+//   1 page statistics only, 2 page scores, 3 group scores, 4 top-k picks, 5 mask
+static int llama_sparse_pages_dry() {
+    const char * e = getenv("LLAMA_SPARSE_DECODE_DRY");
+    return e ? atoi(e) : 0;
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -3676,6 +3683,7 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     const int64_t n_gqa  = n_head/n_kv_h;
     const int64_t n_page = n_kv/64;
     const int64_t n_top  = std::min<int64_t>(n_page, (inp->sp_budget - 80)/64);
+    const int     dry    = llama_sparse_pages_dry();
 
     if (!inp->sp_page_mask) {
         inp->sp_page_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_page);
@@ -3689,6 +3697,10 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
         inp->sp_extra = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 64 + 128, kq_mask->ne[1], n_head, 1);
         ggml_set_input(inp->sp_extra);
         ggml_set_name(inp->sp_extra, "sp_extra");
+    }
+
+    if (dry == 1) {
+        return {kq_mask, 0};
     }
 
     // without cached statistics they are recomputed from the whole cache
@@ -3748,6 +3760,11 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     ggml_tensor * score = ggml_mul_mat(ctx0, stats, qcat);                   // [n_page, n_gqa, n_kv_h]
     score = ggml_add(ctx0, score, inp->sp_page_mask);
 
+    if (dry == 2) {
+        ggml_build_forward_expand(gf, score);
+        return {kq_mask, 0};
+    }
+
     // per-head log-softmax over the eligible pages, then max over the heads of the group
     score = ggml_sub(ctx0, score, ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, n_page, n_page, 0));
     score = ggml_sub(ctx0, score, ggml_log(ctx0, ggml_sum_rows(ctx0, ggml_exp(ctx0, score))));
@@ -3756,14 +3773,29 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     score = ggml_reshape_3d(ctx0, score, n_page, 1, n_kv_h);
     cb(score, "sp_gscore", il);
 
+    if (dry == 3) {
+        ggml_build_forward_expand(gf, score);
+        return {kq_mask, 0};
+    }
+
     ggml_tensor * picks = ggml_top_k(ctx0, score, n_top);                    // [n_top, 1, n_kv_h]
     cb(picks, "sp_picks", il);
+
+    if (dry == 4) {
+        ggml_build_forward_expand(gf, picks);
+        return {kq_mask, 0};
+    }
     picks = ggml_reshape_4d(ctx0, picks, n_top, 1, 1, n_kv_h);
     picks = ggml_repeat_4d(ctx0, picks, n_top, kq_mask->ne[1], n_gqa, n_kv_h);
     picks = ggml_reshape_4d(ctx0, picks, n_top, kq_mask->ne[1], n_head, 1);
 
     ggml_tensor * mask = ggml_top_k_mask(ctx0, kq_mask, picks, nullptr, inp->sp_blocks, inp->sp_extra);
     cb(mask, "sp_mask", il);
+
+    if (dry == 5) {
+        ggml_build_forward_expand(gf, mask);
+        return {kq_mask, 0};
+    }
 
     // page 0, the picks and at most 128 window cells, all aligned to 64
     return {mask, 64*(n_top + 3)};
