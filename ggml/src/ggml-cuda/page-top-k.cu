@@ -133,7 +133,7 @@ static __device__ __forceinline__ int page_top_k_block_scan(int x, int * red, in
 }
 
 // gs_global: [n_kv_h, n_page] scratch when the group scores do not fit in shared memory, else NULL
-static __global__ void page_top_k_select_kernel(
+static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_select_kernel(
         const float * sc, float * gs_global, int32_t * dst, const int n_gqa, const int n_page, const int n_top, const int64_t sd1) {
     ggml_cuda_pdl_lc();
 
@@ -319,7 +319,7 @@ bool ggml_cuda_page_top_k_supported(const ggml_tensor * op) {
     const ggml_tensor * stats = op->src[1];
     const int64_t d  = q->ne[0];
     const size_t  ts = ggml_type_size(stats->type);
-    return d % 2 == 0 && d <= PAGE_TOP_K_MAX_D && q->ne[1]/stats->ne[2] <= 4096 &&
+    return d % 2 == 0 && d <= PAGE_TOP_K_MAX_D && q->ne[1]/stats->ne[2] <= 4096 && stats->view_offs % (2*ts) == 0 &&
         q->nb[1] % sizeof(float) == 0 && stats->nb[1] % (2*ts) == 0 && stats->nb[2] % (2*ts) == 0 &&
         op->nb[1] % sizeof(int32_t) == 0;
 }
