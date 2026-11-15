@@ -9876,6 +9876,11 @@ struct test_page_top_k : public test_case {
         return true;
     }
 
+    // err below compares the output only, not the q and stats views
+    bool run_whole_graph() override {
+        return true;
+    }
+
     // The backends round the scores differently (summation order, exp/log), so two pages whose group scores
     // are within rounding of the cut may swap. Each row must hold n_top distinct pages, the rows of a group
     // must be equal, and a page in one result but not the other must lie within 1e-4 of the cut of the
