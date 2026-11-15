@@ -413,6 +413,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_PAGE_TOP_K,
 
         GGML_OP_UNARY,
 
@@ -2519,6 +2520,25 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // page selection of page-sparse decode (quest score), one token
+    //
+    // q:     [d, n_head]            f32, head h belongs to the KV head h / (n_head / n_kv_h)
+    // stats: [2d, n_page, n_kv_h]   f16 or f32, the per-channel max (first d) and min (last d) of the keys of each page
+    // pmask: [n_page]               f32, added to every page score (0 or -inf)
+    // res:   [n_top, n_head]        i32
+    //
+    // s[h, p]  = sum_j max(scale*q[j, h], 0)*max[j, p] + min(scale*q[j, h], 0)*min[j, p] + pmask[p]
+    // g[k, p]  = max over the heads h of KV head k of (s[h, p] - logsumexp_p s[h, p])
+    // res[:, h] = the n_top pages with the largest g[k, p] of the KV head k of h, ascending; ties go to the lower page
+    //
+    GGML_API struct ggml_tensor * ggml_page_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * stats,
+            struct ggml_tensor  * pmask,
+            int                   n_top,
+            float                 scale);
 
     // custom operators
 

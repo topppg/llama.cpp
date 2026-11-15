@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <numeric>
 
 // ggml_compute_forward_dup
 
@@ -11737,6 +11738,79 @@ void ggml_compute_forward_top_k_mask(
             const char * extra_row = (const char *) extra->data + i1*extra->nb[1] + i2*extra->nb[2] + i3*extra->nb[3];
             for (int64_t j = 0; j < n_extra; ++j) {
                 keep(*(const int32_t *) (extra_row + j*extra->nb[0]));
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_page_top_k
+
+void ggml_compute_forward_page_top_k(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * stats = dst->src[1];
+    const ggml_tensor * pmask = dst->src[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t d      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_page = stats->ne[1];
+    const int64_t n_kv_h = stats->ne[2];
+    const int64_t n_gqa  = n_head/n_kv_h;
+    const int64_t n_top  = dst->ne[0];
+
+    const float * pm = (const float *) pmask->data;
+
+    auto stat = [&](int64_t j, int64_t p, int64_t k) {
+        const char * x = (const char *) stats->data + j*stats->nb[0] + p*stats->nb[1] + k*stats->nb[2];
+        return stats->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) x) : *(const float *) x;
+    };
+
+    std::vector<float>   s(n_page);
+    std::vector<float>   g(n_page);
+    std::vector<float>   qs(d);
+    std::vector<int32_t> idx(n_page);
+
+    for (int64_t k = params->ith; k < n_kv_h; k += params->nth) {
+        std::fill(g.begin(), g.end(), -INFINITY);
+        for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1]);
+            for (int64_t j = 0; j < d; ++j) {
+                qs[j] = scale*qh[j];
+            }
+            float m = -INFINITY;
+            for (int64_t p = 0; p < n_page; ++p) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j < d; ++j) {
+                    acc += qs[j] > 0.0f ? qs[j]*stat(j, p, k) : qs[j]*stat(d + j, p, k);
+                }
+                s[p] = acc + pm[p];
+                m = std::max(m, s[p]);
+            }
+            float lse = 0.0f;
+            if (m > -INFINITY) {
+                double sum = 0.0;
+                for (int64_t p = 0; p < n_page; ++p) {
+                    sum += expf(s[p] - m);
+                }
+                lse = m + (float) log(sum);
+            }
+            for (int64_t p = 0; p < n_page; ++p) {
+                g[p] = std::max(g[p], s[p] - lse);
+            }
+        }
+
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + n_top, idx.end(), [&](int32_t a, int32_t b) {
+            return g[a] > g[b] || (g[a] == g[b] && a < b);
+        });
+        std::sort(idx.begin(), idx.begin() + n_top);
+        for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+            int32_t * out = (int32_t *) ((char *) dst->data + h*dst->nb[1]);
+            for (int64_t i = 0; i < n_top; ++i) {
+                out[i] = idx[i];
             }
         }
     }
