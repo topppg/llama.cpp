@@ -231,6 +231,7 @@ static __global__ void page_top_k_select_kernel(
         __syncthreads();
         if (warp == 0) {
             // lane l holds bins 255 - 8l ... 248 - 8l, counted from the top
+            const int rem = sel_rem;
             int c[8];
             int lsum = 0;
 #pragma unroll
@@ -246,8 +247,8 @@ static __global__ void page_top_k_select_kernel(
                     incl += y;
                 }
             }
-            const int rem  = sel_rem;
             const int excl = incl - lsum;
+            __syncwarp();
             if (excl < rem && incl >= rem) {
                 int cum = excl;
 #pragma unroll
