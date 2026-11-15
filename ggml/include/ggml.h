@@ -2525,7 +2525,7 @@ extern "C" {
     //
     // q:     [d, n_head]            f32, head h belongs to the KV head h / (n_head / n_kv_h)
     // stats: [2d, n_page, n_kv_h]   f16 or f32, the per-channel max (first d) and min (last d) of the keys of each page
-    // pmask: [n_page]               f32, added to every page score (0 or -inf)
+    // pmask: [n_page]               f32, added to every page score (0, or -inf or a large negative value to drop a page)
     // res:   [n_top, n_head]        i32
     //
     // s[h, p]  = sum_j max(scale*q[j, h], 0)*max[j, p] + min(scale*q[j, h], 0)*min[j, p] + pmask[p]
