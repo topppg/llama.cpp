@@ -9847,6 +9847,66 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_PAGE_TOP_K
+struct test_page_top_k : public test_case {
+    const ggml_type type;
+    const int64_t d;
+    const int64_t n_kv_h;
+    const int64_t n_gqa;
+    const int64_t n_page;
+    const int64_t n_top;
+    const int64_t n_masked; // pages with a -inf mask: page 0 and the last n_masked - 1
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked);
+    }
+
+    // page indices, both backends sort them
+    double max_err() override {
+        return 0.0;
+    }
+
+    test_page_top_k(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4, int64_t n_gqa = 8, int64_t n_page = 2048,
+            int64_t n_top = 430, int64_t n_masked = 3)
+        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q is a view with a row stride, as after the split of a fused QKV; stats is the max/min half of the cached statistics
+        ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_kv_h*n_gqa + 2*d*n_kv_h, 1);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * q = ggml_view_2d(ctx, qkv, d, n_kv_h*n_gqa, d*sizeof(float), 0);
+
+        ggml_tensor * ps = ggml_new_tensor_3d(ctx, type, 4*d, n_kv_h, n_page);
+        ggml_set_name(ps, "ps");
+        const size_t ts = ggml_type_size(type);
+        ggml_tensor * stats = ggml_view_3d(ctx, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+
+        ggml_tensor * pmask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_page);
+        ggml_set_name(pmask, "pmask");
+
+        ggml_tensor * out = ggml_page_top_k(ctx, q, stats, pmask, n_top, 1.0f/sqrtf((float) d));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pmask") == 0) {
+                std::vector<float> m(n_page, 0.0f);
+                for (int64_t p = 0; p < n_masked; ++p) {
+                    m[p == 0 ? 0 : n_page - p] = -INFINITY;
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, n_page*sizeof(float));
+            } else if (strcmp(t->name, "qkv") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -10779,6 +10839,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_page_top_k(type));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 8, 4, 2048, 430, 3));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 2, 16, 1001, 1, 0));
+        test_cases.emplace_back(new test_page_top_k(type, 256, 1, 1, 777, 777, 5));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 4096, 4000, 200));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 6, 8192, 2000, 1));
+        test_cases.emplace_back(new test_page_top_k(type, 96, 3, 2, 37, 10, 30));
+    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
