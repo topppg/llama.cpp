@@ -408,6 +408,7 @@ public:
     ggml_tensor * sp_upd64     = nullptr; // I64 same
     int           sp_budget    = 0;
     int           sp_score     = 0;
+    int           sp_fused     = 1;
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;
