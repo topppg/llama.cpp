@@ -1097,6 +1097,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "PAGE_TOP_K",
 
     "UNARY",
 
@@ -1114,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "page_top_k(q, stats, pmask)",
 
     "unary(x)",
 
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6591,6 +6593,35 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_page_top_k
+
+struct ggml_tensor * ggml_page_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * stats,
+        struct ggml_tensor  * pmask,
+        int                   n_top,
+        float                 scale) {
+    const int64_t d = q->ne[0];
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[2] == 1 && q->ne[3] == 1);
+    GGML_ASSERT(stats->type == GGML_TYPE_F16 || stats->type == GGML_TYPE_F32);
+    GGML_ASSERT(stats->nb[0] == ggml_type_size(stats->type) && stats->ne[0] == 2*d && stats->ne[3] == 1);
+    GGML_ASSERT(q->ne[1] % stats->ne[2] == 0);
+    GGML_ASSERT(pmask->type == GGML_TYPE_F32 && ggml_is_contiguous(pmask) && ggml_nelements(pmask) == stats->ne[1]);
+    GGML_ASSERT(n_top > 0 && n_top <= stats->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, q->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_PAGE_TOP_K;
+    result->src[0] = q;
+    result->src[1] = stats;
+    result->src[2] = pmask;
 
     return result;
 }

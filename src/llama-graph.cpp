@@ -642,6 +642,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //                                       and the top (B - 80)/64 pages of 64 cells per KV head
 //   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
 //   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest)
+//   LLAMA_SPARSE_DECODE_FUSED=0         quest with cached statistics: select with the unfused chain of ops instead of ggml_page_top_k
 static int llama_sparse_pages_budget() {
     const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
@@ -652,6 +653,11 @@ static int llama_sparse_pages_budget() {
 static int64_t llama_sparse_pages_min_ctx() {
     const char * e = getenv("LLAMA_SPARSE_DECODE_MIN_CTX");
     return e ? atoll(e) : 32768;
+}
+
+static bool llama_sparse_pages_fused() {
+    const char * e = getenv("LLAMA_SPARSE_DECODE_FUSED");
+    return !e || atoi(e) != 0;
 }
 
 static int llama_sparse_pages_score() {
@@ -3689,6 +3695,26 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
         inp->sp_extra = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 64 + 128, kq_mask->ne[1], n_head, 1);
         ggml_set_input(inp->sp_extra);
         ggml_set_name(inp->sp_extra, "sp_extra");
+    }
+
+    // quest with cached statistics: scores, log-softmax, group max and top-k in one op
+    if (ps && inp->sp_score == 1 && llama_sparse_pages_fused()) {
+        const size_t  ts    = ggml_element_size(ps);
+        ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+        ggml_tensor * q2    = ggml_view_2d(ctx0, q, d, n_head, q->nb[1], 0);
+
+        ggml_tensor * picks = ggml_page_top_k(ctx0, q2, stats, inp->sp_page_mask, n_top, kq_scale); // [n_top, n_head]
+        cb(picks, "sp_picks", il);
+
+        picks = ggml_reshape_4d(ctx0, picks, n_top, 1, n_head, 1);
+        if (kq_mask->ne[1] > 1) {
+            picks = ggml_repeat_4d(ctx0, picks, n_top, kq_mask->ne[1], n_head, 1);
+        }
+
+        ggml_tensor * mask = ggml_top_k_mask(ctx0, kq_mask, picks, nullptr, inp->sp_blocks, inp->sp_extra);
+        cb(mask, "sp_mask", il);
+
+        return {mask, 64*(n_top + 3)};
     }
 
     // without cached statistics they are recomputed from the whole cache
