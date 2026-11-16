@@ -392,6 +392,7 @@ public:
     ggml_tensor * sp_chunks_ex = nullptr; // I32 [8] FUSED=3: the 32-cell chunks of page 0 and the window, ascending, -1 padded
     ggml_tensor * sp_upd       = nullptr; // I32 [n_batch/64 + 2] pages whose statistics are refreshed
     ggml_tensor * sp_upd64     = nullptr; // I64 same
+    int64_t       sp_checked   = -1; // cache size whose mask was last checked cell by cell
     int           sp_budget    = 0;
     int           sp_score     = 0;
     int           sp_fused     = 1;
