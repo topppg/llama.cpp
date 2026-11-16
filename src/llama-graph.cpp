@@ -717,6 +717,24 @@ static int llama_sparse_pages_score() {
     GGML_ABORT("LLAMA_SPARSE_DECODE_SCORE must be mv, quest or mean");
 }
 
+// the page rule indexes cells by position: cell c of the first mask row must be visible exactly when c <= pos.
+// Checked cell by cell when the cache size changes, else at the edges and around pos (the scan cost about 0.1 ms per token).
+static void llama_sparse_check_mask(const ggml_tensor * mask, int64_t pos, int64_t & checked) {
+    const ggml_fp16_t * m    = (const ggml_fp16_t *) mask->data;
+    const int64_t       n_kv = mask->ne[0];
+    auto ok = [&](int64_t c) { return c < 0 || c >= n_kv || (ggml_fp16_to_fp32(m[c]) != -INFINITY) == (c <= pos); };
+    bool good = ok(0) && ok(pos - 1) && ok(pos) && ok(pos + 1) && ok(n_kv - 1);
+    if (good && checked != n_kv) {
+        for (int64_t c = 0; c < n_kv && good; ++c) {
+            good = ok(c);
+        }
+        checked = n_kv;
+    }
+    if (!good) {
+        GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
+    }
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -738,12 +756,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const int64_t c1 = ubatch->pos[ubatch->n_tokens - 1] + 1;
         GGML_ASSERT(c1 - c0 == ubatch->n_tokens);
         GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
-        const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
-        for (int64_t c = 0; c < self_attn_mask.raw->ne[0]; ++c) {
-            if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= c0)) {
-                GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
-            }
-        }
+        llama_sparse_check_mask(self_attn_mask.raw, c0, sp_checked);
         std::vector<int32_t> pages;
         for (int64_t p = std::max<int64_t>(0, (c0 + 63)/64 - 1); 64*p + 63 < c1; ++p) {
             if (64*p + 63 >= c0) {
@@ -766,12 +779,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
         // the page rule indexes cells by position: check that cell c is visible exactly when c <= pos
         GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
-        const ggml_fp16_t * m = (const ggml_fp16_t *) self_attn_mask.raw->data;
-        for (int64_t c = 0; c < n_kv; ++c) {
-            if ((ggml_fp16_to_fp32(m[c]) != -INFINITY) != (c <= pos)) {
-                GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
-            }
-        }
+        llama_sparse_check_mask(self_attn_mask.raw, pos, sp_checked);
+        GGML_UNUSED(n_kv);
 
         const int64_t n_page  = sp_page_mask->ne[0];
         const int64_t win_blk = std::max<int64_t>(0, (pos - 63)/64);
