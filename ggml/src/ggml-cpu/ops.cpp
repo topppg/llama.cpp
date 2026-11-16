@@ -11859,6 +11859,63 @@ void ggml_compute_forward_page_top_k(
     }
 }
 
+// ggml_compute_forward_page_stats
+
+void ggml_compute_forward_page_stats(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * k   = dst->src[0];
+    const ggml_tensor * upd = dst->src[2];
+
+    const int64_t d      = k->ne[0];
+    const int64_t n_kv_h = k->ne[1];
+    const int64_t n_upd  = ggml_nelements(upd);
+    const int64_t n_page = k->ne[2]/64;
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(k->type)->to_float;
+
+    std::vector<float> x(64*d);
+    std::vector<float> st(4*d);
+
+    for (int64_t i = params->ith; i < n_upd*n_kv_h; i += params->nth) {
+        const int64_t p = ((const int32_t *) upd->data)[i/n_kv_h];
+        const int64_t h = i % n_kv_h;
+        GGML_ASSERT(p >= 0 && p < n_page);
+        for (int64_t c = 0; c < 64; ++c) {
+            to_float((const char *) k->data + h*k->nb[1] + (64*p + c)*k->nb[2], x.data() + c*d, d);
+        }
+        for (int64_t j = 0; j < d; ++j) {
+            float sum = 0.0f;
+            float mx  = -INFINITY;
+            float mn  =  INFINITY;
+            for (int64_t c = 0; c < 64; ++c) {
+                const float v = x[c*d + j];
+                sum += v;
+                mx = std::max(mx, v);
+                mn = std::min(mn, v);
+            }
+            const float mu = sum/64.0f;
+            float var = 0.0f;
+            for (int64_t c = 0; c < 64; ++c) {
+                const float e = x[c*d + j] - mu;
+                var += e*e;
+            }
+            st[j] = mu;
+            st[d + j] = var/64.0f;
+            st[2*d + j] = mx;
+            st[3*d + j] = mn;
+        }
+        char * out = (char *) dst->data + h*dst->nb[1] + p*dst->nb[2];
+        if (dst->type == GGML_TYPE_F16) {
+            for (int64_t j = 0; j < 4*d; ++j) {
+                ((ggml_fp16_t *) out)[j] = GGML_CPU_FP32_TO_FP16(st[j]);
+            }
+        } else {
+            memcpy(out, st.data(), 4*d*sizeof(float));
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

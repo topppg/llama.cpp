@@ -1098,6 +1098,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "PAGE_TOP_K",
+    "PAGE_STATS",
 
     "UNARY",
 
@@ -1117,7 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,6 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "page_top_k(q, stats, pmask)",
+    "page_stats(k, ps, upd)",
 
     "unary(x)",
 
@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6698,6 +6700,30 @@ struct ggml_tensor * ggml_page_top_k_chunks(
     result->src[1] = stats;
     result->src[2] = pmask;
     result->src[3] = extra;
+
+    return result;
+}
+
+// ggml_page_stats
+
+struct ggml_tensor * ggml_page_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * ps,
+        struct ggml_tensor  * upd) {
+    const int64_t d = k->ne[0];
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type) && k->ne[3] == 1 && k->ne[2] % 64 == 0);
+    GGML_ASSERT(ps->type == GGML_TYPE_F32 || ps->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(ps) && ps->ne[0] == 4*d && ps->ne[1] == k->ne[1] && ps->ne[2] >= k->ne[2]/64 && ps->ne[3] == 1);
+    GGML_ASSERT(upd->type == GGML_TYPE_I32 && ggml_is_contiguous(upd));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, ps);
+
+    result->op     = GGML_OP_PAGE_STATS;
+    result->src[0] = k;
+    result->src[1] = ps;
+    result->src[2] = upd;
 
     return result;
 }

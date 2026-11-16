@@ -10244,6 +10244,46 @@ struct test_page_top_k : public test_case {
     }
 };
 
+// GGML_OP_PAGE_STATS
+struct test_page_stats : public test_case {
+    const ggml_type type_k;
+    const ggml_type type_ps;
+    const int64_t   d;
+    const int64_t   n_kv_h;
+    const int64_t   n_page;
+    const std::vector<int32_t> upd;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_k, type_ps, d, n_kv_h, n_page, upd.size());
+    }
+
+    test_page_stats(ggml_type type_k = GGML_TYPE_Q8_0, ggml_type type_ps = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4,
+            int64_t n_page = 64, std::vector<int32_t> upd = {62, 63})
+        : type_k(type_k), type_ps(type_ps), d(d), n_kv_h(n_kv_h), n_page(n_page), upd(upd) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, d, n_kv_h, 64*n_page);
+        ggml_set_name(k, "k");
+        ggml_tensor * ps = ggml_new_tensor_3d(ctx, type_ps, 4*d, n_kv_h, n_page);
+        ggml_set_name(ps, "ps");
+        ggml_tensor * u = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, upd.size());
+        ggml_set_name(u, "upd");
+        ggml_tensor * out = ggml_page_stats(ctx, k, ps, u);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "upd") == 0) {
+                ggml_backend_tensor_set(t, upd.data(), 0, upd.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -11194,6 +11234,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // the -1e30 mask of llama-graph, including more picks than unmasked pages
         test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f));
         test_cases.emplace_back(new test_page_top_k(type, 128, 2, 4, 256, 250, 20, -1e30f));
+        // the page statistics refresh of decode (two pages, one repeated as llama-graph pads) and of a batch
+        for (ggml_type type_k : {GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_page_stats(type_k, type, 128, 4, 64, {62, 63}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 128, 8, 64, {63, 63}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 64, 2, 40, {0, 7, 8, 9, 39, 39}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 256, 1, 16, {3}));
+        }
         // chunk lists for flash attention: the MoE and 8B shapes, odd page counts, global group scores, MQA
         test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f, true));
         test_cases.emplace_back(new test_page_top_k(type, 128, 8, 4, 1980, 430, 3, -1e30f, true));
