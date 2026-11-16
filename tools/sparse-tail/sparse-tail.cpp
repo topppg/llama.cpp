@@ -1,5 +1,6 @@
 // sparse-tail: dense prefill of T - n_tail tokens, then n_tail teacher-forced single-token decode steps per config,
-// KL(dense || config) of the next-token distribution per row. Configs set LLAMA_SPARSE_DECODE / LLAMA_SPARSE_DECODE_SCORE.
+// KL(dense || config) of the next-token distribution per row. Configs set LLAMA_SPARSE_DECODE / LLAMA_SPARSE_DECODE_SCORE,
+// and score:budget:f0|f1|f2 also LLAMA_SPARSE_DECODE_FUSED (without the suffix the variable is left as it is).
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -19,6 +20,7 @@ struct tail_config {
     std::string name;
     std::string score;
     int         budget = 0;
+    std::string fused;
 };
 
 struct dump_state {
@@ -148,6 +150,10 @@ int main(int argc, char ** argv) {
             auto p = split(c, ':');
             tc.score  = p[0];
             tc.budget = std::stoi(p[1]);
+            if (p.size() > 2) {
+                if (p[2] != "f0" && p[2] != "f1" && p[2] != "f2") { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
+                tc.fused = p[2].substr(1);
+            }
         }
         configs.push_back(tc);
     }
@@ -223,6 +229,9 @@ int main(int argc, char ** argv) {
         if (c.budget > 0) {
             setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
             setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
+            if (!c.fused.empty()) {
+                setenv("LLAMA_SPARSE_DECODE_FUSED", c.fused.c_str(), 1);
+            }
             break;
         }
     }
@@ -288,6 +297,9 @@ int main(int argc, char ** argv) {
             if (c.budget > 0) {
                 setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
                 setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
+                if (!c.fused.empty()) {
+                    setenv("LLAMA_SPARSE_DECODE_FUSED", c.fused.c_str(), 1);
+                }
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
@@ -345,6 +357,9 @@ int main(int argc, char ** argv) {
             if (c.budget > 0) {
                 setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
                 setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
+                if (!c.fused.empty()) {
+                    setenv("LLAMA_SPARSE_DECODE_FUSED", c.fused.c_str(), 1);
+                }
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
@@ -412,6 +427,9 @@ int main(int argc, char ** argv) {
             if (c.budget > 0) {
                 setenv("LLAMA_SPARSE_DECODE", std::to_string(c.budget).c_str(), 1);
                 setenv("LLAMA_SPARSE_DECODE_SCORE", c.score.c_str(), 1);
+                if (!c.fused.empty()) {
+                    setenv("LLAMA_SPARSE_DECODE_FUSED", c.fused.c_str(), 1);
+                }
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
