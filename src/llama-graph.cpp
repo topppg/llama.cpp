@@ -769,7 +769,9 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         pages.resize(n_upd, pages.back());
         std::vector<int64_t> pages64(pages.begin(), pages.end());
         ggml_backend_tensor_set(sp_upd,   pages.data(),   0, ggml_nbytes(sp_upd));
-        ggml_backend_tensor_set(sp_upd64, pages64.data(), 0, ggml_nbytes(sp_upd64));
+        if (sp_upd64->buffer) { // FUSED=3 refreshes with ggml_page_stats, which reads sp_upd only
+            ggml_backend_tensor_set(sp_upd64, pages64.data(), 0, ggml_nbytes(sp_upd64));
+        }
     }
 
     if (sp_page_mask && sp_page_mask->buffer) {
