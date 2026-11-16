@@ -1,6 +1,6 @@
 // sparse-tail: dense prefill of T - n_tail tokens, then n_tail teacher-forced single-token decode steps per config,
 // KL(dense || config) of the next-token distribution per row. Configs set LLAMA_SPARSE_DECODE / LLAMA_SPARSE_DECODE_SCORE,
-// and score:budget:f0|f1|f2 also LLAMA_SPARSE_DECODE_FUSED (without the suffix the variable is left as it is).
+// and score:budget:f0|f1|f2|f3 also LLAMA_SPARSE_DECODE_FUSED (without the suffix the variable is left as it is).
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
             tc.score  = p[0];
             tc.budget = std::stoi(p[1]);
             if (p.size() > 2) {
-                if (p[2] != "f0" && p[2] != "f1" && p[2] != "f2") { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
+                if (p[2] != "f0" && p[2] != "f1" && p[2] != "f2" && p[2] != "f3") { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
                 tc.fused = p[2].substr(1);
             }
         }
