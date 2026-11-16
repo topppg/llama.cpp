@@ -2,22 +2,33 @@
 #include "convert.cuh"
 
 // page selection of page-sparse decode in two kernels:
-//   score:  one block per 32 pages of a KV head, one thread per (page, head), plus per-block partial log-sum-exp
+//   score:  one warp per page, the scores of all the heads of its KV head, up to PAGE_TOP_K_GQA_CHUNK heads per pass,
+//           and per block and head the max and sum of exp of its scores (the select kernel merges them into the log-sum-exp)
 //   select: one block per KV head, log-softmax per head, max over the group, radix select of the top pages
 
 #define PAGE_TOP_K_GQA_CHUNK    16
 #define PAGE_TOP_K_MAX_D        512
 #define PAGE_TOP_K_SMEM_FLOATS  10240 // lse and group scores in shared memory up to this many floats, else in global memory
-#define PAGE_TOP_K_SCORE_PAGES  32 // pages per score block, one per lane
-#define PAGE_TOP_K_SCORE_J      64 // channels staged in shared memory at a time
+#define PAGE_TOP_K_SCORE_WARPS  8
+#define PAGE_TOP_K_SCORE_PAGES  32
 #define PAGE_TOP_K_SELECT_SIZE  1024
 #define PAGE_TOP_K_LSE_PAD(n)   (((n) + 3) & ~3)
 #define PAGE_TOP_K_MAX_EXTRA    256
 
+template <typename TS>
+static __device__ __forceinline__ float2 page_top_k_load2(const TS * x);
+
+template <>
+__device__ __forceinline__ float2 page_top_k_load2<half>(const half * x) {
+    return __half22float2(*(const half2 *) x);
+}
+
+template <>
+__device__ __forceinline__ float2 page_top_k_load2<float>(const float * x) {
+    return *(const float2 *) x;
+}
+
 // sc[k, g, p] = sum_j max(qs[j], 0)*max[j, p] + min(qs[j], 0)*min[j, p] + pmask[p], qs = scale*q of head k*n_gqa + g
-// One block per 32 pages of a KV head; thread (x, y) scores page x for head y of the current group pass. The statistics of the
-// 32 pages are staged in shared memory PAGE_TOP_K_SCORE_J channels at a time. Each warp (one head, 32 pages) also writes the
-// max and the sum of exp of its scores, part[k, g, block], from which the select kernel gets the log-sum-exp of each head.
 template <typename TS>
 static __global__ void page_top_k_score_kernel(
         const float * q, const TS * stats, const float * pmask, float * sc, float2 * part,
@@ -25,61 +36,72 @@ static __global__ void page_top_k_score_kernel(
         const int64_t sq1, const int64_t ss1, const int64_t ss2, const float scale) {
     ggml_cuda_pdl_lc();
 
-    __shared__ float qs[PAGE_TOP_K_GQA_CHUNK][PAGE_TOP_K_SCORE_J];
-    __shared__ float st[PAGE_TOP_K_SCORE_PAGES][2*PAGE_TOP_K_SCORE_J + 1]; // max then min, padded against bank conflicts
+    extern __shared__ float qs[]; // [PAGE_TOP_K_GQA_CHUNK, d]
+    __shared__ float sb[PAGE_TOP_K_GQA_CHUNK][PAGE_TOP_K_SCORE_PAGES]; // this block's scores, for the partial log-sum-exp
 
     const int k    = blockIdx.y;
-    const int tx   = threadIdx.x;
-    const int ty   = threadIdx.y;
-    const int nt   = blockDim.x*blockDim.y;
-    const int tid  = ty*blockDim.x + tx;
-    const int p0   = blockIdx.x*PAGE_TOP_K_SCORE_PAGES;
-    const int p    = p0 + tx;
-    const int n_bx = gridDim.x;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int p1   = min(n_page, (int) (blockIdx.x + 1)*PAGE_TOP_K_SCORE_PAGES);
 
     ggml_cuda_pdl_sync();
 
-    const float pm = p < n_page ? pmask[p] : -INFINITY;
+    for (int g0 = 0; g0 < n_gqa; g0 += PAGE_TOP_K_GQA_CHUNK) {
+        const int ng = min(PAGE_TOP_K_GQA_CHUNK, n_gqa - g0);
 
-    for (int g0 = 0; g0 < n_gqa; g0 += blockDim.y) {
-        const int  g    = g0 + ty;
-        const bool head = g < n_gqa;
+        __syncthreads();
+        for (int i = threadIdx.x; i < ng*d; i += blockDim.x) {
+            const int g = i / d;
+            const int j = i % d;
+            qs[i] = scale*q[(int64_t) (k*n_gqa + g0 + g)*sq1 + j];
+        }
+        __syncthreads();
 
-        float acc = 0.0f;
-        for (int j0 = 0; j0 < d; j0 += PAGE_TOP_K_SCORE_J) {
-            __syncthreads();
-            for (int i = tid; i < PAGE_TOP_K_SCORE_PAGES*2*PAGE_TOP_K_SCORE_J; i += nt) {
-                const int pl = i / (2*PAGE_TOP_K_SCORE_J);
-                const int c  = i % (2*PAGE_TOP_K_SCORE_J);
-                const int j  = j0 + c % PAGE_TOP_K_SCORE_J;
-                const int pp = p0 + pl;
-                float v = 0.0f;
-                if (pp < n_page && j < d) {
-                    v = ggml_cuda_cast<float>(stats[pp*ss1 + k*ss2 + (c < PAGE_TOP_K_SCORE_J ? 0 : d) + j]);
+        for (int p = blockIdx.x*PAGE_TOP_K_SCORE_PAGES + warp; p < p1; p += PAGE_TOP_K_SCORE_WARPS) {
+            const TS * st = stats + p*ss1 + k*ss2;
+
+            float acc[PAGE_TOP_K_GQA_CHUNK];
+#pragma unroll
+            for (int g = 0; g < PAGE_TOP_K_GQA_CHUNK; ++g) {
+                acc[g] = 0.0f;
+            }
+
+            for (int j = 2*lane; j < d; j += 2*WARP_SIZE) {
+                const float2 mx = page_top_k_load2(st + j);
+                const float2 mn = page_top_k_load2(st + d + j);
+#pragma unroll
+                for (int g = 0; g < PAGE_TOP_K_GQA_CHUNK; ++g) {
+                    if (g < ng) {
+                        const float a = qs[g*d + j];
+                        const float b = qs[g*d + j + 1];
+                        acc[g] += (a > 0.0f ? a*mx.x : a*mn.x) + (b > 0.0f ? b*mx.y : b*mn.y);
+                    }
                 }
-                st[pl][c] = v;
             }
-            for (int i = tid; i < (int) blockDim.y*PAGE_TOP_K_SCORE_J; i += nt) {
-                const int gg = i / PAGE_TOP_K_SCORE_J;
-                const int j  = j0 + i % PAGE_TOP_K_SCORE_J;
-                qs[gg][i % PAGE_TOP_K_SCORE_J] = g0 + gg < n_gqa && j < d ? scale*q[(int64_t) (k*n_gqa + g0 + gg)*sq1 + j] : 0.0f;
-            }
-            __syncthreads();
-#pragma unroll 16
-            for (int jj = 0; jj < PAGE_TOP_K_SCORE_J; ++jj) {
-                const float a = qs[ty][jj];
-                acc += a > 0.0f ? a*st[tx][jj] : a*st[tx][PAGE_TOP_K_SCORE_J + jj];
+
+            const float pm = pmask[p];
+#pragma unroll
+            for (int g = 0; g < PAGE_TOP_K_GQA_CHUNK; ++g) {
+                if (g < ng) {
+                    const float s = warp_reduce_sum(acc[g]);
+                    if (lane == 0) {
+                        sc[((int64_t) k*n_gqa + g0 + g)*n_page + p] = s + pm;
+                        sb[g][p - blockIdx.x*PAGE_TOP_K_SCORE_PAGES] = s + pm;
+                    }
+                }
             }
         }
 
-        const float sv = p < n_page ? acc + pm : -INFINITY;
-        if (head && p < n_page) {
-            sc[((int64_t) k*n_gqa + g)*n_page + p] = sv;
-        }
-        const float m = warp_reduce_max(sv);
-        const float e = warp_reduce_sum(m > -INFINITY ? expf(sv - m) : 0.0f);
-        if (head && tx == 0) {
-            part[((int64_t) k*n_gqa + g)*n_bx + blockIdx.x] = make_float2(m, e);
+        // per head of this pass: max and sum of exp over the block's pages
+        __syncthreads();
+        const int np = p1 - (int) blockIdx.x*PAGE_TOP_K_SCORE_PAGES;
+        for (int g = warp; g < ng; g += PAGE_TOP_K_SCORE_WARPS) {
+            const float v = lane < np ? sb[g][lane] : -INFINITY;
+            const float m = warp_reduce_max(v);
+            const float e = warp_reduce_sum(m > -INFINITY && lane < np ? expf(v - m) : 0.0f);
+            if (lane == 0) {
+                part[((int64_t) k*n_gqa + g0 + g)*gridDim.x + blockIdx.x] = make_float2(m, e);
+            }
         }
     }
 }
@@ -403,8 +425,8 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_pool_alloc<float2> part(ctx.pool(), (size_t) n_kv_h*n_gqa*n_bx);
 
     const dim3 score_grid(n_bx, n_kv_h, 1);
-    const dim3 score_block(PAGE_TOP_K_SCORE_PAGES, std::min(n_gqa, PAGE_TOP_K_GQA_CHUNK), 1);
-    const ggml_cuda_kernel_launch_params score_params(score_grid, score_block, 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params score_params(score_grid, dim3(PAGE_TOP_K_SCORE_WARPS*WARP_SIZE, 1, 1),
+            (size_t) std::min(n_gqa, PAGE_TOP_K_GQA_CHUNK)*d*sizeof(float), ctx.stream());
     ggml_cuda_kernel_launch(page_top_k_score_kernel<TS>, score_params,
             (const float *) q->data, (const TS *) stats->data, (const float *) pmask->data, sc.get(), part.get(),
             d, n_gqa, n_page, (int64_t) (q->nb[1]/sizeof(float)), (int64_t) (stats->nb[1]/sizeof(TS)), (int64_t) (stats->nb[2]/sizeof(TS)),
