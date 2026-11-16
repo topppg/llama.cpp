@@ -3669,6 +3669,14 @@ ggml_tensor * llm_graph_context::build_page_stats(
     }
     const int64_t n_upd = inp->sp_upd->ne[0];
 
+    // FUSED=3: one op instead of the chain below
+    if (inp->sp_fused == 3 && (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0)) {
+        ggml_tensor * out = ggml_page_stats(ctx0, k, ps, inp->sp_upd);
+        cb(out, "sp_ps", il);
+        ggml_build_forward_expand(gf, out);
+        return out;
+    }
+
     // the 64 cells of each refreshed page, from the cache
     ggml_tensor * rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, k, d*n_kv_h*64, n_kv/64), inp->sp_upd); // f32 [d*n_kv_h*64, n_upd]
     rows = ggml_reshape_4d(ctx0, rows, d, n_kv_h, 64, n_upd);
