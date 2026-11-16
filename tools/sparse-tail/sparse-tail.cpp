@@ -310,6 +310,10 @@ int main(int argc, char ** argv) {
             const int64_t t1 = ggml_time_us();
             for (int s = 0; s < gp.max_new; ++s) {
                 const llama_pos pos = Pt + s;
+                ds.active = dump_set.count(c.name) && ds.steps.count(s);
+                ds.with_k = false;
+                ds.prefix = "p" + std::to_string(gp.id) + "_" + c.name + "_s" + std::to_string(s);
+                std::replace(ds.prefix.begin(), ds.prefix.end(), ':', '-');
                 llama_batch_ext_clear(batch);
                 const int32_t idx = llama_batch_ext_add_token(batch, 0, tok);
                 llama_batch_ext_set_pos(batch, idx, &pos);
@@ -324,6 +328,7 @@ int main(int argc, char ** argv) {
                 outv.push_back(am);
                 tok = am;
             }
+            ds.active = false;
             const double t_gen = (ggml_time_us() - t1)/1e6;
             fprintf(out, "{\"id\": %d, \"config\": \"%s\", \"len\": %d, \"prefill_s\": %.3f, \"gen_s\": %.3f, \"out\": [", gp.id, c.name.c_str(), Pt + 1, t_pre, t_gen);
             for (size_t i = 0; i < outv.size(); ++i) fprintf(out, "%s%d", i ? ", " : "", outv[i]);
