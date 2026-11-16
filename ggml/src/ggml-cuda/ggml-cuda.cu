@@ -75,6 +75,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/page-top-k.cuh"
+#include "ggml-cuda/page-stats.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3058,6 +3059,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_PAGE_TOP_K:
             ggml_cuda_op_page_top_k(ctx, dst);
+            break;
+        case GGML_OP_PAGE_STATS:
+            ggml_cuda_op_page_stats(ctx, dst);
             break;
         default:
             return false;
@@ -6685,6 +6689,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
         case GGML_OP_PAGE_TOP_K:
             return ggml_cuda_page_top_k_supported(op);
+        case GGML_OP_PAGE_STATS:
+            return ggml_cuda_page_stats_supported(op);
 
         default:
             return false;

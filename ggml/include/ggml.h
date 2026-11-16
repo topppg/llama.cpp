@@ -414,6 +414,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_PAGE_TOP_K,
+        GGML_OP_PAGE_STATS,
 
         GGML_OP_UNARY,
 
@@ -2561,6 +2562,19 @@ extern "C" {
             struct ggml_tensor  * extra,
             int                   n_top,
             float                 scale);
+
+    // refresh the cached statistics of pages of 64 cells (page-sparse decode), in place
+    //
+    // k:   [d, n_kv_h, n_kv]      f32, f16 or q8_0, the K cache
+    // ps:  [4d, n_kv_h, n_page]   f32 or f16, per page and KV head the per-channel [mean, var, max, min] over the page's cells
+    // upd: [n_upd]                i32, the pages to refresh, repeats allowed
+    // res: ps
+    //
+    GGML_API struct ggml_tensor * ggml_page_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * ps,
+            struct ggml_tensor  * upd);
 
     // custom operators
 
