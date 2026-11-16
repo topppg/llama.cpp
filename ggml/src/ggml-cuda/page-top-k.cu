@@ -11,6 +11,7 @@
 #define PAGE_TOP_K_SCORE_PAGES  32
 #define PAGE_TOP_K_SELECT_SIZE  1024
 #define PAGE_TOP_K_LSE_PAD(n)   (((n) + 3) & ~3)
+#define PAGE_TOP_K_MAX_EXTRA    256
 
 template <typename TS>
 static __device__ __forceinline__ float2 page_top_k_load2(const TS * x);
@@ -134,8 +135,10 @@ static __device__ __forceinline__ int page_top_k_block_scan(int x, int * red, in
 }
 
 // gs_global: [n_kv_h, n_page] scratch when the group scores do not fit in shared memory, else NULL
+// chunks: dst rows are chunk lists [n, ascending chunks 2p, 2p + 1 of the picks and the extra chunks not of a picked page]
 static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_select_kernel(
-        const float * sc, float * gs_global, int32_t * dst, const int n_gqa, const int n_page, const int n_top, const int64_t sd1) {
+        const float * sc, float * gs_global, int32_t * dst, const int n_gqa, const int n_page, const int n_top, const int64_t sd1,
+        const int32_t * extra, const int n_extra_in, const bool chunks) {
     ggml_cuda_pdl_lc();
 
     extern __shared__ float smem[]; // lse [n_gqa padded to 4], then the group scores [n_page] unless gs_global
@@ -144,6 +147,11 @@ static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_sele
     __shared__ int   hist[256];
     __shared__ uint32_t sel_prefix;
     __shared__ int      sel_rem;
+    // chunks: the valid extra chunks, picks before each one's page (-1: its page is picked, dropped), kept extras before it
+    __shared__ int   ex[PAGE_TOP_K_MAX_EXTRA];
+    __shared__ int   ex_before[PAGE_TOP_K_MAX_EXTRA];
+    __shared__ int   ex_kpre[PAGE_TOP_K_MAX_EXTRA + 1];
+    __shared__ int   n_ex;
 
     const int k    = blockIdx.x;
     const int tid  = threadIdx.x;
@@ -305,14 +313,94 @@ static __global__ void __launch_bounds__(PAGE_TOP_K_SELECT_SIZE) page_top_k_sele
     }
     int pos = page_top_k_block_scan(n_in, red_i, &tot);
 
+    if (!chunks) {
+        for (int p = p0; p < p1; ++p) {
+            const uint32_t key = page_top_k_key(gs[p]);
+            if (key > thr || (key == thr && eq_rank++ < rem)) {
+                for (int g = 0; g < n_gqa; ++g) {
+                    dst[(int64_t) (k*n_gqa + g)*sd1 + pos] = p;
+                }
+                pos++;
+            }
+        }
+        return;
+    }
+
+    // chunk lists: the valid extras (ascending, in range), then which survive and how many picks precede each
+    if (tid == 0) {
+        int n = 0;
+        for (int i = 0; i < n_extra_in; ++i) {
+            const int c = extra[i];
+            if (c >= 0 && c < 2*n_page && (n == 0 || c > ex[n - 1])) {
+                ex[n++] = c;
+            }
+        }
+        n_ex = n;
+    }
+    __syncthreads();
+    const int ne = n_ex;
+
+    // the first extra at or after chunk c
+    auto ex_lower = [&](const int c) {
+        int lo = 0;
+        int hi = ne;
+        while (lo < hi) {
+            const int mid = (lo + hi)/2;
+            if (ex[mid] < c) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    };
+
+    {
+        int r   = eq_rank;
+        int cnt = pos;
+        int j   = ex_lower(2*p0);
+        for (int p = p0; p < p1; ++p) {
+            const uint32_t key = page_top_k_key(gs[p]);
+            const bool picked = key > thr || (key == thr && r++ < rem);
+            for (; j < ne && ex[j] < 2*p + 2; ++j) {
+                ex_before[j] = picked ? -1 : cnt;
+            }
+            cnt += picked;
+        }
+    }
+    __syncthreads();
+
+    int n_kept;
+    const int kpre = page_top_k_block_scan(tid < ne && ex_before[tid] >= 0, red_i, &n_kept);
+    if (tid < ne) {
+        ex_kpre[tid] = kpre;
+    }
+    if (tid == 0) {
+        ex_kpre[ne] = n_kept;
+    }
+    __syncthreads();
+
     for (int p = p0; p < p1; ++p) {
         const uint32_t key = page_top_k_key(gs[p]);
         if (key > thr || (key == thr && eq_rank++ < rem)) {
+            // the kept extras before chunk 2p are those before chunk 2p + 2: chunks of page p are not kept
+            const int o = 1 + 2*pos + ex_kpre[ex_lower(2*p)];
             for (int g = 0; g < n_gqa; ++g) {
-                dst[(int64_t) (k*n_gqa + g)*sd1 + pos] = p;
+                int32_t * row = dst + (int64_t) (k*n_gqa + g)*sd1;
+                row[o]     = 2*p;
+                row[o + 1] = 2*p + 1;
             }
             pos++;
         }
+    }
+    if (tid < ne && ex_before[tid] >= 0) {
+        const int o = 1 + ex_kpre[tid] + 2*ex_before[tid];
+        for (int g = 0; g < n_gqa; ++g) {
+            dst[(int64_t) (k*n_gqa + g)*sd1 + o] = ex[tid];
+        }
+    }
+    for (int g = tid; g < n_gqa; g += nt) {
+        dst[(int64_t) (k*n_gqa + g)*sd1] = 2*n_top + n_kept;
     }
 }
 
@@ -323,7 +411,7 @@ bool ggml_cuda_page_top_k_supported(const ggml_tensor * op) {
     const size_t  ts = ggml_type_size(stats->type);
     return d % 2 == 0 && d <= PAGE_TOP_K_MAX_D && q->ne[1]/stats->ne[2] <= 4096 && stats->view_offs % (2*ts) == 0 &&
         q->nb[1] % sizeof(float) == 0 && stats->nb[1] % (2*ts) == 0 && stats->nb[2] % (2*ts) == 0 &&
-        op->nb[1] % sizeof(int32_t) == 0;
+        op->nb[1] % sizeof(int32_t) == 0 && (!op->src[3] || ggml_nelements(op->src[3]) <= PAGE_TOP_K_MAX_EXTRA);
 }
 
 template <typename TS>
@@ -339,7 +427,9 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int n_page = stats->ne[1];
     const int n_kv_h = stats->ne[2];
     const int n_gqa  = n_head/n_kv_h;
-    const int n_top  = dst->ne[0];
+    const int  n_top  = ggml_get_op_params_i32(dst, 1);
+    const bool chunks = ggml_get_op_params_i32(dst, 2) != 0;
+    const ggml_tensor * extra = chunks ? dst->src[3] : nullptr;
 
     const bool gs_smem = PAGE_TOP_K_LSE_PAD(n_gqa) + n_page <= PAGE_TOP_K_SMEM_FLOATS;
 
@@ -358,7 +448,8 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (size_t) (PAGE_TOP_K_LSE_PAD(n_gqa) + (gs_smem ? n_page : 0))*sizeof(float), ctx.stream());
     ggml_cuda_kernel_launch(page_top_k_select_kernel, select_params,
             (const float *) sc.get(), gs_smem ? nullptr : gs.get(), (int32_t *) dst->data, n_gqa, n_page, n_top,
-            (int64_t) (dst->nb[1]/sizeof(int32_t)));
+            (int64_t) (dst->nb[1]/sizeof(int32_t)),
+            extra ? (const int32_t *) extra->data : nullptr, extra ? (int) ggml_nelements(extra) : 0, chunks);
 }
 
 void ggml_cuda_op_page_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

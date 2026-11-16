@@ -5514,6 +5514,21 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_chunk_list(
+        struct ggml_tensor * a,
+        struct ggml_tensor * list) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && "chunk lists and kv_rows cannot be combined");
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    GGML_ASSERT(list->type == GGML_TYPE_I32 && ggml_is_contiguous(list));
+    GGML_ASSERT(k->ne[1] % 32 == 0 && list->ne[0] == k->ne[1]/32 + 1);
+    GGML_ASSERT(list->ne[1] == q->ne[2] && list->ne[2] == q->ne[3] && list->ne[3] == 1);
+
+    a->src[6] = list;
+    ggml_set_op_params_i32(a, 5, 32); // listed chunks are whole chunks
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -6599,13 +6614,11 @@ struct ggml_tensor * ggml_top_k_mask(
 
 // ggml_page_top_k
 
-struct ggml_tensor * ggml_page_top_k(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * stats,
-        struct ggml_tensor  * pmask,
-        int                   n_top,
-        float                 scale) {
+static void ggml_page_top_k_check(
+        const struct ggml_tensor * q,
+        const struct ggml_tensor * stats,
+        const struct ggml_tensor * pmask,
+        int                        n_top) {
     const int64_t d = q->ne[0];
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[2] == 1 && q->ne[3] == 1);
     GGML_ASSERT(stats->type == GGML_TYPE_F16 || stats->type == GGML_TYPE_F32);
@@ -6613,15 +6626,53 @@ struct ggml_tensor * ggml_page_top_k(
     GGML_ASSERT(q->ne[1] % stats->ne[2] == 0);
     GGML_ASSERT(pmask->type == GGML_TYPE_F32 && ggml_is_contiguous(pmask) && ggml_nelements(pmask) == stats->ne[1]);
     GGML_ASSERT(n_top > 0 && n_top <= stats->ne[1]);
+}
+
+struct ggml_tensor * ggml_page_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * stats,
+        struct ggml_tensor  * pmask,
+        int                   n_top,
+        float                 scale) {
+    ggml_page_top_k_check(q, stats, pmask, n_top);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, q->ne[1]);
 
     ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, n_top);
+    ggml_set_op_params_i32(result, 2, 0);
 
     result->op     = GGML_OP_PAGE_TOP_K;
     result->src[0] = q;
     result->src[1] = stats;
     result->src[2] = pmask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_page_top_k_chunks(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * stats,
+        struct ggml_tensor  * pmask,
+        struct ggml_tensor  * extra,
+        int                   n_top,
+        float                 scale) {
+    ggml_page_top_k_check(q, stats, pmask, n_top);
+    GGML_ASSERT(extra->type == GGML_TYPE_I32 && ggml_is_contiguous(extra) && ggml_nelements(extra) <= 256);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2*stats->ne[1] + 1, q->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, n_top);
+    ggml_set_op_params_i32(result, 2, 1);
+
+    result->op     = GGML_OP_PAGE_TOP_K;
+    result->src[0] = q;
+    result->src[1] = stats;
+    result->src[2] = pmask;
+    result->src[3] = extra;
 
     return result;
 }
