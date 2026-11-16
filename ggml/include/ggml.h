@@ -2282,6 +2282,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Attend only to the cells of listed chunks of 32 cells; the mask still applies to them. Needs n_kv_max >= 32*n of every row.
+    // list: [n_kv/32 + 1, n_head, n_seq] i32, row = [n, c_0 < c_1 < ... < c_{n-1}] (n_head, n_seq as in q)
+    GGML_API void ggml_flash_attn_ext_set_chunk_list(
+            struct ggml_tensor * a,
+            struct ggml_tensor * list);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2537,6 +2543,18 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * stats,
             struct ggml_tensor  * pmask,
+            int                   n_top,
+            float                 scale);
+
+    // as ggml_page_top_k, but the result is a chunk list for ggml_flash_attn_ext_set_chunk_list (pages of 64 cells, chunks of 32):
+    // extra: [n_extra] i32, ascending chunk ids kept in every row, -1 entries are skipped, at most 256
+    // res:   [2*n_page + 1, n_head] i32, row h = [n, the ascending union of the chunks 2p, 2p + 1 of the picks p of h and of extra]
+    GGML_API struct ggml_tensor * ggml_page_top_k_chunks(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * stats,
+            struct ggml_tensor  * pmask,
+            struct ggml_tensor  * extra,
             int                   n_top,
             float                 scale);
 

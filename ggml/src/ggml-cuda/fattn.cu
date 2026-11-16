@@ -669,6 +669,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // a chunk list (page-sparse decode) is read only by the paged vector kernel: one query, no softcap, n_kv_max set
+    if (KQV->src[6]) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        return BEST_FATTN_KERNEL_NONE;
+#else
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const bool paged_ok = mask && Q->ne[1] == 1 && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+            K->ne[1] % FATTN_KQ_STRIDE == 0 && mask->ne[0] == K->ne[1] && logit_softcap == 0.0f && !kv_rows &&
+            ggml_get_op_params_i32(KQV, 4) > 0 && ggml_get_op_params_i32(KQV, 5) == FATTN_PAGED_CHUNK;
+        return paged_ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    }
+
     if (mask && mask->ne[2] != 1) {
         // the kv_rows mask is compacted per sequence, it has no head dimension
         if (kv_rows) {

@@ -274,8 +274,10 @@ static __global__ void flash_attn_ext_vec(
     static_assert(!paged || (nthreads == nwarps*WARP_SIZE && WARP_SIZE == FATTN_PAGED_CHUNK), "paged mode needs one chunk per warp");
 
     const int k_VKQ_max = paged ? 0 : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
-    const int   n_chunks_vis = paged ? KV_max[sequence*ne02 + head] : 0;
-    const int * chunks       = paged ? KV_max + ne02*ne03 + int64_t(sequence*ne02 + head)*(ne11/FATTN_PAGED_CHUNK) : nullptr;
+    // paged: one row [n, chunks...] of ne11/FATTN_PAGED_CHUNK + 1 ints per (sequence, q head)
+    const int * chunk_row    = paged ? KV_max + int64_t(sequence*ne02 + head)*(ne11/FATTN_PAGED_CHUNK + 1) : nullptr;
+    const int   n_chunks_vis = paged ? chunk_row[0] : 0;
+    const int * chunks       = paged ? chunk_row + 1 : nullptr;
     const char * K_base     = K;
     const char * V_base     = V;
     const half * maskh_base = maskh;
@@ -286,7 +288,7 @@ static __global__ void flash_attn_ext_vec(
         if constexpr (paged) {
             const int ci = it*nwarps + threadIdx.y;
             KQ_pad  = ci < n_chunks_vis ? 0.0f : -INFINITY;
-            k_VKQ_0 = chunks[ci < n_chunks_vis ? ci : 0]*FATTN_PAGED_CHUNK - threadIdx.y*WARP_SIZE;
+            k_VKQ_0 = (ci < n_chunks_vis ? chunks[ci] : 0)*FATTN_PAGED_CHUNK - threadIdx.y*WARP_SIZE;
         }
         K     = K_base     + int64_t(k_VKQ_0)*nb11;
         V     = V_base     + int64_t(k_VKQ_0)*nb21;

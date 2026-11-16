@@ -8870,6 +8870,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * chunk_list = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8974,6 +8975,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // the listed chunks of this head, ascending
+        const int32_t * cl   = chunk_list ? (const int32_t *) ((const char *) chunk_list->data + iq2*chunk_list->nb[1] + iq3*chunk_list->nb[2]) : nullptr;
+        const int32_t * cl_b = cl ? cl + 1 : nullptr;
+        const int32_t * cl_e = cl ? cl + 1 + cl[0] : nullptr;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -8981,6 +8987,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
+                continue;
+            }
+            if (cl && !std::binary_search(cl_b, cl_e, (int32_t) (ic/32))) {
                 continue;
             }
 
@@ -9554,7 +9563,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !dst->src[6] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -11759,9 +11768,24 @@ void ggml_compute_forward_page_top_k(
     const int64_t n_page = stats->ne[1];
     const int64_t n_kv_h = stats->ne[2];
     const int64_t n_gqa  = n_head/n_kv_h;
-    const int64_t n_top  = dst->ne[0];
+    const int64_t n_top  = ggml_get_op_params_i32(dst, 1);
+    const bool    chunks = ggml_get_op_params_i32(dst, 2) != 0;
 
     const float * pm = (const float *) pmask->data;
+
+    // chunk lists: the extra chunks, ascending, -1 skipped
+    std::vector<int32_t> extra;
+    if (chunks) {
+        const ggml_tensor * ex = dst->src[3];
+        for (int64_t i = 0; i < ggml_nelements(ex); ++i) {
+            const int32_t c = ((const int32_t *) ex->data)[i];
+            if (c >= 0) {
+                GGML_ASSERT((extra.empty() || c > extra.back()) && c < 2*n_page);
+                extra.push_back(c);
+            }
+        }
+    }
+    std::vector<int32_t> list;
 
     auto stat = [&](int64_t j, int64_t p, int64_t k) {
         const char * x = (const char *) stats->data + j*stats->nb[0] + p*stats->nb[1] + k*stats->nb[2];
@@ -11807,8 +11831,27 @@ void ggml_compute_forward_page_top_k(
             return g[a] > g[b] || (g[a] == g[b] && a < b);
         });
         std::sort(idx.begin(), idx.begin() + n_top);
+        if (chunks) {
+            list.clear();
+            for (int64_t i = 0; i < n_top; ++i) {
+                list.push_back(2*idx[i]);
+                list.push_back(2*idx[i] + 1);
+            }
+            for (const int32_t c : extra) {
+                if (!std::binary_search(idx.begin(), idx.begin() + n_top, c/2)) {
+                    list.push_back(c);
+                }
+            }
+            std::sort(list.begin(), list.end());
+        }
         for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
             int32_t * out = (int32_t *) ((char *) dst->data + h*dst->nb[1]);
+            if (chunks) {
+                out[0] = (int32_t) list.size();
+                std::copy(list.begin(), list.end(), out + 1);
+                std::fill(out + 1 + list.size(), out + dst->ne[0], -1);
+                continue;
+            }
             for (int64_t i = 0; i < n_top; ++i) {
                 out[i] = idx[i];
             }
