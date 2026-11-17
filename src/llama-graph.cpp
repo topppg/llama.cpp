@@ -3846,8 +3846,9 @@ const llama_kv_cache_context * mctx_cur,
         ps = stores_k ? build_page_stats(sp, k, mctx_cur->get_ps(il), il) : mctx_cur->get_ps(il);
     }
 
-    // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size
-    if (sp->sp_budget > 0 && !hparams.is_swa(il) && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && kq_mask->type == GGML_TYPE_F16 &&
+    // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size,
+    // head size <= 256 (the paged CUDA vec kernel; gemma4's 512 global heads stay dense)
+    if (sp->sp_budget > 0 && !hparams.is_swa(il) && q->ne[0] <= 256 && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && kq_mask->type == GGML_TYPE_F16 &&
             k->ne[3] == 1 && k->ne[2] % 64 == 0 && k->ne[2] >= llama_sparse_pages_min_ctx()) {
         return build_sparse_pages(sp, q, k, kq_mask, ps, kq_scale, il, chunk_list);
     }
