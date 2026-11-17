@@ -366,6 +366,7 @@ int main(int argc, char ** argv) {
     FILE * out = out_path.empty() ? stdout : fopen(out_path.c_str(), "w");
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
 
+    std::string pf_counts = "{}"; // the sparse prefill counts of the last prefill, as JSON
     // prefill of ids[0 .. n) under the prefill setting of group g, then the state saved for the rewinds
     auto prefill = [&](const int32_t * ids, int n, size_t g) {
         const tail_config & c0 = configs[groups[g][0]];
@@ -385,6 +386,7 @@ int main(int argc, char ** argv) {
         ds.prefix = "prefill_" + c0.name;
         std::replace(ds.prefix.begin(), ds.prefix.end(), ':', '-');
         const int32_t n_reused0 = llama_perf_context(ctx).n_reused;
+        llama_sparse_prefill_counts_get(true);
         for (int i = 0; i < n; i += cp.n_batch) {
             const int m = std::min<int>(cp.n_batch, n - i);
             llama_batch_ext_clear(batch);
@@ -396,6 +398,15 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); exit(1); }
         }
         ds.active = false;
+        {
+            const llama_sparse_prefill_counts pc = llama_sparse_prefill_counts_get(true);
+            char buf[320];
+            snprintf(buf, sizeof(buf), "{\"sparse\": %lld, \"sparse_rows\": %lld, \"dense_rows\": %lld, \"no_sel\": %lld, \"fallback\": %lld, "
+                     "\"layers\": %d, \"ub_min\": %d, \"ub_max\": %d}", (long long) pc.n_sparse, (long long) pc.n_sparse_rows,
+                     (long long) pc.n_dense_rows, (long long) pc.n_no_sel, (long long) pc.n_fallback, pc.n_layers, pc.ub_min, pc.ub_max);
+            pf_counts = buf;
+            fprintf(stderr, "prefill %s: pf counts %s\n", c0.name.c_str(), buf);
+        }
         const int32_t n_reused = llama_perf_context(ctx).n_reused - n_reused0;
         if (n_reused > 0) {
             fprintf(stderr, "prefill %s: %d graphs reused\n", c0.name.c_str(), n_reused);
@@ -454,7 +465,7 @@ int main(int argc, char ** argv) {
                 }
                 ds.active = false;
                 const double t_gen = (ggml_time_us() - t1)/1e6;
-                fprintf(out, "{\"id\": %d, \"config\": \"%s\", \"len\": %d, \"prefill_s\": %.3f, \"gen_s\": %.3f, \"out\": [", gp.id, c.name.c_str(), Pt + 1, t_pre, t_gen);
+                fprintf(out, "{\"id\": %d, \"config\": \"%s\", \"len\": %d, \"prefill_s\": %.3f, \"gen_s\": %.3f, \"pf\": %s, \"out\": [", gp.id, c.name.c_str(), Pt + 1, t_pre, t_gen, pf_counts.c_str());
                 for (size_t i = 0; i < outv.size(); ++i) fprintf(out, "%s%d", i ? ", " : "", outv[i]);
                 fprintf(out, "]}\n");
                 fflush(out);
@@ -589,8 +600,9 @@ int main(int argc, char ** argv) {
                 double mean = 0.0;
                 for (double x : kl) mean += x;
                 mean /= n_tail;
-                fprintf(out, "{\"book\": %d, \"T\": %d, \"config\": \"%s\", \"kl_mean\": %.9g, \"kl_p99\": %.9g, \"kl_max\": %.9g, \"flip\": %.6g, \"reads\": %.3f, \"max_abs_logit_diff\": %.9g, \"tail_s\": %.3f, \"kl_rows\": [",
-                        b, T, c.name.c_str(), mean, srt[(size_t) std::floor(0.99*(n_tail - 1))], srt.back(), (double) flips/n_tail, reads/n_tail, max_diff, sec);
+                fprintf(out, "{\"book\": %d, \"T\": %d, \"config\": \"%s\", \"kl_mean\": %.9g, \"kl_p99\": %.9g, \"kl_max\": %.9g, \"flip\": %.6g, \"reads\": %.3f, \"max_abs_logit_diff\": %.9g, \"tail_s\": %.3f, \"pf\": %s, \"kl_rows\": [",
+                        b, T, c.name.c_str(), mean, srt[(size_t) std::floor(0.99*(n_tail - 1))], srt.back(), (double) flips/n_tail, reads/n_tail, max_diff, sec,
+                        pf_counts.c_str());
                 for (int s = 0; s < n_tail; ++s) fprintf(out, "%s%.6g", s ? ", " : "", kl[s]);
                 fprintf(out, "]}\n");
                 fflush(out);

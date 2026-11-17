@@ -1721,6 +1721,20 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 
+    // sparse prefill emulation (LLAMA_SPARSE_PREFILL), counted while multi-token graphs of real ubatches are built, all contexts
+    struct llama_sparse_prefill_counts {
+        int64_t n_sparse;        // (layer, ubatch, KV head) attentions that ran with the page mask
+        int64_t n_sparse_rows;   // (layer, row) pairs with sparse attention
+        int64_t n_dense_rows;    // (layer, row) pairs kept dense by LLAMA_SPARSE_PREFILL_ROWS in layers on the sparse path
+        int64_t n_no_sel;        // (layer, ubatch) without a selectable page (dense, e.g. the first ubatch)
+        int64_t n_fallback;      // (layer, ubatch) that fell back to dense for an unsupported condition
+        int32_t n_layers;        // layers with at least one sparse ubatch
+        int32_t ub_min;          // sparse ubatches per such layer: min and max
+        int32_t ub_max;
+    };
+    // returns the counts since the last reset; reset = true starts a new count
+    LLAMA_API struct llama_sparse_prefill_counts llama_sparse_prefill_counts_get(bool reset);
+
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);

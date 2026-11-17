@@ -27,6 +27,8 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <map>
+#include <mutex>
 
 // dedup helpers
 
@@ -757,6 +759,40 @@ static llama_sparse_prefill_plan llama_sparse_prefill_make_plan(int64_t c0, int6
     }
     pl.n_dummy = pl.n_top - k_min;
     return pl;
+}
+
+// counters of the sparse prefill emulation, see llama_sparse_prefill_counts in llama.h
+static std::mutex                 g_pf_mutex;
+static llama_sparse_prefill_counts g_pf_counts = {};
+static std::map<int, int32_t>     g_pf_layer_ub;
+
+static void llama_sparse_prefill_count(int il, int64_t sparse, int64_t sparse_rows, int64_t dense_rows, int64_t no_sel, int64_t fallback) {
+    std::lock_guard<std::mutex> lock(g_pf_mutex);
+    g_pf_counts.n_sparse      += sparse;
+    g_pf_counts.n_sparse_rows += sparse_rows;
+    g_pf_counts.n_dense_rows  += dense_rows;
+    g_pf_counts.n_no_sel      += no_sel;
+    g_pf_counts.n_fallback    += fallback;
+    if (sparse > 0) {
+        g_pf_layer_ub[il]++;
+    }
+}
+
+llama_sparse_prefill_counts llama_sparse_prefill_counts_get(bool reset) {
+    std::lock_guard<std::mutex> lock(g_pf_mutex);
+    llama_sparse_prefill_counts c = g_pf_counts;
+    c.n_layers = (int32_t) g_pf_layer_ub.size();
+    c.ub_min = 0;
+    c.ub_max = 0;
+    for (const auto & [il, n] : g_pf_layer_ub) {
+        c.ub_min = c.ub_min == 0 ? n : std::min(c.ub_min, n);
+        c.ub_max = std::max(c.ub_max, n);
+    }
+    if (reset) {
+        g_pf_counts = {};
+        g_pf_layer_ub.clear();
+    }
+    return c;
 }
 
 static int llama_sparse_pages_budget() {
@@ -4020,11 +4056,20 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
     if (sp->pf_frac > 0.0 && nt > 1) {
         sp->pf_seen = true;
     }
-    if (sp->pf_frac <= 0.0 || !ps || nt <= 1 || hparams.is_swa(il) || kv_rows || kq_b || v_mla || !cparams.flash_attn || cparams.training ||
+    // counted only for real ubatches (a reserve ubatch has no consecutive positions) of layers meant for the sparse path
+    const bool counted = sp->pf_frac > 0.0 && nt > 1 && ps && !hparams.is_swa(il) &&
+                         ubatch.pos && ubatch.pos[nt - 1] - ubatch.pos[0] == nt - 1;
+    if (sp->pf_frac <= 0.0 || !ps || nt <= 1 || hparams.is_swa(il)) {
+        return nullptr;
+    }
+    if (kv_rows || kq_b || v_mla || !cparams.flash_attn || cparams.training ||
             hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f || (sinks && (!ggml_is_vector(sinks) || sinks->type != GGML_TYPE_F32)) ||
             kq_mask->type != GGML_TYPE_F16 || kq_mask->ne[1] != nt || kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 ||
             k->ne[3] != 1 || k->ne[2] % 64 != 0 || k->ne[2] < llama_sparse_prefill_min_ctx() || v->nb[1] > v->nb[2] ||
             q->ne[1] % k->ne[1] != 0 || v->ne[1] != k->ne[1]) {
+        if (counted) {
+            llama_sparse_prefill_count(il, 0, 0, 0, 0, 1);
+        }
         return nullptr;
     }
 
@@ -4050,6 +4095,9 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
             r0 = std::clamp<int64_t>(rlo - c0, 0, nt);
             r1 = std::clamp<int64_t>(rhi == INT64_MAX ? nt : rhi - c0, 0, nt);
             if (r0 >= r1) {
+                if (counted) {
+                    llama_sparse_prefill_count(il, 0, 0, nt, 0, 0);
+                }
                 return nullptr;
             }
         } else {
@@ -4059,7 +4107,13 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
 
     const llama_sparse_prefill_plan pl = llama_sparse_prefill_make_plan(c0, nt, sp->pf_frac, sp->pf_window);
     if (pl.n_top == 0) {
+        if (counted) {
+            llama_sparse_prefill_count(il, 0, 0, 0, 1, 0);
+        }
         return nullptr; // no query block has a selectable page
+    }
+    if (counted) {
+        llama_sparse_prefill_count(il, n_kv_h, r1 - r0, nt - (r1 - r0), 0, 0);
     }
     const int64_t n_qblk = pl.n_qblk;
     const int64_t n_top  = pl.n_top;
