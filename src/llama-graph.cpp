@@ -696,28 +696,14 @@ static void llama_sparse_check_mask(const ggml_tensor * mask, int64_t pos, int64
     }
 }
 
-void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    // the idxs are left unallocated when the KV cache is bypassed during training
-    if (self_k_idxs && self_k_idxs->buffer) {
-        mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    }
-    if (self_v_idxs && self_v_idxs->buffer) {
-        mctx->set_input_v_idxs(self_v_idxs, ubatch);
-    }
-
-    // the mask is left unallocated when the graph only stores K/V without attending
-    // (e.g. DFlash's KV-injection pass)
-    if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
-        mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
-    }
-
+void llm_sparse_pages::set_input(const ggml_tensor * mask, const llama_ubatch * ubatch) {
     if (sp_upd && sp_upd->buffer) {
         // pages completed by this ubatch, and the page that becomes eligible at its last position
         const int64_t c0 = ubatch->pos[0];
         const int64_t c1 = ubatch->pos[ubatch->n_tokens - 1] + 1;
         GGML_ASSERT(c1 - c0 == ubatch->n_tokens);
-        GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
-        llama_sparse_check_mask(self_attn_mask.raw, c0, sp_checked);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(mask->buffer));
+        llama_sparse_check_mask(mask, c0, sp_checked);
         std::vector<int32_t> pages;
         for (int64_t p = std::max<int64_t>(0, (c0 + 63)/64 - 1); 64*p + 63 < c1; ++p) {
             if (64*p + 63 >= c0) {
@@ -738,11 +724,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (sp_page_mask && sp_page_mask->buffer) {
         GGML_ASSERT(ubatch->n_tokens == 1);
         const int64_t pos  = ubatch->pos[0];
-        const int64_t n_kv = self_attn_mask.raw->ne[0];
+        const int64_t n_kv = mask->ne[0];
 
         // the page rule indexes cells by position: check that cell c is visible exactly when c <= pos
-        GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer));
-        llama_sparse_check_mask(self_attn_mask.raw, pos, sp_checked);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(mask->buffer));
+        llama_sparse_check_mask(mask, pos, sp_checked);
         GGML_UNUSED(n_kv);
 
         const int64_t n_page  = sp_page_mask->ne[0];
@@ -792,6 +778,30 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_sparse_pages::can_reuse() const {
+    return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused();
+}
+
+void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    // the idxs are left unallocated when the KV cache is bypassed during training
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
+
+    // the mask is left unallocated when the graph only stores K/V without attending
+    // (e.g. DFlash's KV-injection pass)
+    if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
+        mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
+        sp->set_input(self_attn_mask.raw, ubatch);
+    }
+}
+
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
@@ -804,7 +814,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
 
-    res &= sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused();
+    res &= sp->can_reuse();
 
     return res;
 }
@@ -936,6 +946,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
+
+    if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
+        sp->set_input(self_attn_mask.raw, ubatch);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -964,6 +978,8 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (self_attn_mask_swa.raw && self_attn_mask_swa.raw->buffer) {
         res &= can_reuse_attn_mask(self_attn_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
+
+    res &= sp->can_reuse();
 
     return res;
 }
@@ -1351,6 +1367,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+        inp_attn->sp->set_input(inp_attn->self_attn_mask.raw, ubatch);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1375,6 +1395,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->sp->can_reuse();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3528,20 +3550,7 @@ ggml_tensor * llm_graph_context::build_attn(
     int64_t       n_kv_max   = 0;
     ggml_tensor * chunk_list = nullptr;
 
-    inp->sp_budget = llama_sparse_pages_budget();
-    inp->sp_score  = llama_sparse_pages_score();
-    inp->sp_fused  = llama_sparse_pages_fused();
-
-    ggml_tensor * ps = nullptr;
-    if (mctx_cur->get_ps(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
-        ps = build_page_stats(inp, k, mctx_cur->get_ps(il), il);
-    }
-
-    // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size
-    if (inp->sp_budget > 0 && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && mask->type == GGML_TYPE_F16 &&
-            k->ne[3] == 1 && k->ne[2] % 64 == 0 && k->ne[2] >= llama_sparse_pages_min_ctx()) {
-        std::tie(mask, n_kv_max) = build_sparse_pages(inp, q, k, mask, ps, kq_scale, il, &chunk_list);
-    }
+    std::tie(mask, n_kv_max) = build_sparse_decode(inp->sp.get(), mctx_cur, q, k, mask, kv_rows, true, kq_scale, il, &chunk_list);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
@@ -3660,8 +3669,38 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_decode(
+       llm_sparse_pages * sp,
+const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * kq_mask,
+            ggml_tensor * kv_rows,
+                   bool   stores_k,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor ** chunk_list) const {
+    sp->sp_budget = llama_sparse_pages_budget();
+    sp->sp_score  = llama_sparse_pages_score();
+    sp->sp_fused  = llama_sparse_pages_fused();
+
+    ggml_tensor * ps = nullptr;
+    if (mctx_cur->get_ps(il) && !hparams.is_swa(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
+        // a layer that reuses another layer's K (shared KV) selects with that layer's statistics, refreshed there
+        ps = stores_k ? build_page_stats(sp, k, mctx_cur->get_ps(il), il) : mctx_cur->get_ps(il);
+    }
+
+    // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size
+    if (sp->sp_budget > 0 && !hparams.is_swa(il) && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && kq_mask->type == GGML_TYPE_F16 &&
+            k->ne[3] == 1 && k->ne[2] % 64 == 0 && k->ne[2] >= llama_sparse_pages_min_ctx()) {
+        return build_sparse_pages(sp, q, k, kq_mask, ps, kq_scale, il, chunk_list);
+    }
+
+    return {kq_mask, 0};
+}
+
 ggml_tensor * llm_graph_context::build_page_stats(
-        llm_graph_input_attn_kv * inp,
+               llm_sparse_pages * inp,
         ggml_tensor * k,
         ggml_tensor * ps,
                 int   il) const {
@@ -3713,7 +3752,7 @@ ggml_tensor * llm_graph_context::build_page_stats(
 }
 
 std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
-        llm_graph_input_attn_kv * inp,
+               llm_sparse_pages * inp,
         ggml_tensor * q,
         ggml_tensor * k,
         ggml_tensor * kq_mask,
@@ -4060,6 +4099,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    // page-sparse decode applies to the full-attention layers that attend over the base cache with its own mask
+    const bool own_mask = kq_mask == nullptr;
     if (!kq_mask) {
         kq_mask = is_swa ? inp->self_attn_mask_swa.raw : inp->self_attn_mask.raw;
     }
@@ -4069,7 +4110,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    int64_t       n_kv_max   = 0;
+    ggml_tensor * chunk_list = nullptr;
+    if (!is_swa && own_mask && !use_kv_cur) {
+        std::tie(kq_mask, n_kv_max) = build_sparse_decode(inp->sp.get(), mctx_cur, q, k, kq_mask, kv_rows, store_kv && k_cur, kq_scale, il, &chunk_list);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
