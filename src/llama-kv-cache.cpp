@@ -244,9 +244,10 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
-        // page-sparse decode (LLAMA_SPARSE_DECODE) keeps per-page K statistics, f16 unless LLAMA_SPARSE_DECODE_STATS=f32
+        // page-sparse decode (LLAMA_SPARSE_DECODE) keeps per-page K statistics, f16 unless LLAMA_SPARSE_DECODE_STATS=f32,
+        // in full-attention caches only (the SWA cache of an iSWA model has none)
         ggml_tensor * ps = nullptr;
-        if (getenv("LLAMA_SPARSE_DECODE") && has_k && n_stream == 1 && kv_size % 64 == 0) {
+        if (getenv("LLAMA_SPARSE_DECODE") && has_k && n_stream == 1 && kv_size % 64 == 0 && swa_type == LLAMA_SWA_TYPE_NONE) {
             const char * e = getenv("LLAMA_SPARSE_DECODE_STATS");
             const ggml_type type_ps = e && strcmp(e, "f32") == 0 ? GGML_TYPE_F32 : GGML_TYPE_F16;
             ps = ggml_new_tensor_3d(ctx, type_ps, 4*hparams.n_embd_head_k(il), hparams.n_head_kv(il), kv_size/64);
