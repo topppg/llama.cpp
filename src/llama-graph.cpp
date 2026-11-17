@@ -693,6 +693,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //                                       KV head's query heads. The other pages are -inf in the mask, flash attention runs per KV head.
 //   LLAMA_SPARSE_PREFILL_WINDOW=<W>     the window: the pages from the one holding cell (block start - W) to the block (default 512)
 //   LLAMA_SPARSE_PREFILL_MIN_CTX=<n>    only caches of at least n cells use it (default 0)
+//   LLAMA_SPARSE_PREFILL_ROWS=<lo>:<hi> only the query rows at positions lo <= pos < hi are sparse, the others are dense
+//                                       (hi may be empty: no upper limit). The page picks of a block still use all its rows.
 // Needs flash attention, one sequence whose cell index equals its position, no ALiBi. Composes with LLAMA_SPARSE_DECODE,
 // which then selects from the K written by the sparse prefill.
 static float llama_sparse_prefill_frac() {
@@ -707,6 +709,20 @@ static int64_t llama_sparse_prefill_window() {
     const int64_t w = e ? atoll(e) : 512;
     GGML_ASSERT(w >= 0 && "LLAMA_SPARSE_PREFILL_WINDOW must be >= 0");
     return w;
+}
+
+// [lo, hi) positions of the sparse query rows, default all
+static std::pair<int64_t, int64_t> llama_sparse_prefill_rows() {
+    const char * e = getenv("LLAMA_SPARSE_PREFILL_ROWS");
+    if (!e || !*e) {
+        return {0, INT64_MAX};
+    }
+    const char * c = strchr(e, ':');
+    GGML_ASSERT(c && "LLAMA_SPARSE_PREFILL_ROWS must be lo:hi");
+    const int64_t lo = atoll(e);
+    const int64_t hi = c[1] ? atoll(c + 1) : INT64_MAX;
+    GGML_ASSERT(lo >= 0 && hi >= lo && "LLAMA_SPARSE_PREFILL_ROWS must be lo:hi with 0 <= lo <= hi");
+    return {lo, hi};
 }
 
 static int64_t llama_sparse_prefill_min_ctx() {
@@ -936,7 +952,8 @@ void llm_sparse_pages::set_input(const ggml_tensor * mask, const llama_ubatch * 
 bool llm_sparse_pages::can_reuse() const {
     // a sparse prefill graph depends on the positions of its ubatch
     return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused() &&
-        pf_frac == llama_sparse_prefill_frac() && pf_window == llama_sparse_prefill_window() && !pf_tmask;
+        pf_frac == llama_sparse_prefill_frac() && pf_window == llama_sparse_prefill_window() && !pf_tmask &&
+        (pf_frac == 0.0f || !getenv("LLAMA_SPARSE_PREFILL_ROWS"));
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -4016,9 +4033,26 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
 
     // a reserve ubatch has no real positions: plan for the deepest one
     int64_t c0 = ubatch.pos ? ubatch.pos[0] : 0;
-    if (!ubatch.pos || ubatch.pos[nt - 1] - c0 != nt - 1) {
+    const bool real = ubatch.pos && ubatch.pos[nt - 1] - c0 == nt - 1;
+    if (!real) {
         c0 = n_kv - nt;
     }
+    // the sparse rows r0 .. r1 - 1 of a real ubatch; a reserve ubatch plans for the sparse path and the dense rows
+    int64_t r0 = 0;
+    int64_t r1 = nt;
+    const auto [rlo, rhi] = llama_sparse_prefill_rows();
+    if (rlo > 0 || rhi < INT64_MAX) {
+        if (real) {
+            r0 = std::clamp<int64_t>(rlo - c0, 0, nt);
+            r1 = std::clamp<int64_t>(rhi == INT64_MAX ? nt : rhi - c0, 0, nt);
+            if (r0 >= r1) {
+                return nullptr;
+            }
+        } else {
+            r0 = nt/2;
+        }
+    }
+
     const llama_sparse_prefill_plan pl = llama_sparse_prefill_make_plan(c0, nt, sp->pf_frac, sp->pf_window);
     if (pl.n_top == 0) {
         return nullptr; // no query block has a selectable page
@@ -4105,6 +4139,18 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
 
         ggml_tensor * oh = build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, 0, kq_scale, il, nullptr); // [dv*n_gqa, nt]
         cur = cur ? ggml_concat(ctx0, cur, oh, 0) : oh;
+    }
+
+    if (r0 > 0 || r1 < nt) {
+        // the dense rows from a dense attention of the whole ubatch
+        ggml_tensor * dense = build_attn_mha(q, k, v, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il, nullptr);
+        GGML_ASSERT(ggml_are_same_shape(dense, cur) && ggml_n_dims(cur) <= 2);
+        auto rows = [&](ggml_tensor * t, int64_t a, int64_t b) { return ggml_view_2d(ctx0, t, t->ne[0], b - a, t->nb[1], a*t->nb[1]); };
+        ggml_tensor * out = r0 > 0 ? ggml_concat(ctx0, rows(dense, 0, r0), rows(cur, r0, r1), 1) : rows(cur, r0, r1);
+        if (r1 < nt) {
+            out = ggml_concat(ctx0, out, rows(dense, r1, nt), 1);
+        }
+        cur = out;
     }
 
     return cur;

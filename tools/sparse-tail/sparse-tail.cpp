@@ -3,6 +3,8 @@
 // and score:budget:f0|f1|f2|f3 also LLAMA_SPARSE_DECODE_FUSED (without the suffix the variable is left as it is).
 // A config pf:F[:W] sets LLAMA_SPARSE_PREFILL=F (and LLAMA_SPARSE_PREFILL_WINDOW=W) during the prefill, with dense decode;
 // pf:F[:W]+score:budget[:fN] combines both. Configs with the same prefill share one prefill.
+// pf:F:W:R limits the sparse query rows of a prefill of n tokens (LLAMA_SPARSE_PREFILL_ROWS): R = d<N> keeps the last N
+// rows dense, s<N> makes only the last N rows sparse, du keeps the last ubatch dense.
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -25,7 +27,20 @@ struct tail_config {
     std::string fused;
     std::string pf;        // LLAMA_SPARSE_PREFILL, empty for a dense prefill
     std::string pf_window; // LLAMA_SPARSE_PREFILL_WINDOW, empty for the default
+    std::string pf_rows;   // d<N>, s<N> or du, empty for all rows
 };
+
+// LLAMA_SPARSE_PREFILL_ROWS for a prefill of n tokens in ubatches of n_ubatch from position 0
+static std::string prefill_rows(const std::string & r, int n, int n_ubatch) {
+    if (r.empty()) {
+        return "";
+    }
+    if (r == "du") {
+        return "0:" + std::to_string((n - 1)/n_ubatch*n_ubatch);
+    }
+    const int m = std::max(0, n - std::stoi(r.substr(1)));
+    return r[0] == 'd' ? "0:" + std::to_string(m) : std::to_string(m) + ":";
+}
 
 static void set_prefill_env(const std::string & pf, const std::string & window) {
     if (pf.empty()) {
@@ -184,10 +199,17 @@ int main(int argc, char ** argv) {
             if (p.size() < 2) { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
             if (p[0] == "pf") {
                 const double f = std::stod(p[1]);
-                if (!(f > 0.0 && f <= 1.0) || p.size() > 3) { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
+                if (!(f > 0.0 && f <= 1.0) || p.size() > 4) { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
                 tc.pf = p[1];
                 if (p.size() > 2) {
                     tc.pf_window = p[2];
+                }
+                if (p.size() > 3) {
+                    const std::string & r = p[3];
+                    if (r != "du" && !(r.size() > 1 && (r[0] == 'd' || r[0] == 's') && strspn(r.c_str() + 1, "0123456789") == r.size() - 1)) {
+                        fprintf(stderr, "bad config %s\n", c.c_str()); return 1;
+                    }
+                    tc.pf_rows = r;
                 }
                 continue;
             }
@@ -205,7 +227,7 @@ int main(int argc, char ** argv) {
     {
         std::map<std::string, size_t> gi;
         for (size_t i = 0; i < configs.size(); ++i) {
-            const std::string key = configs[i].pf + ":" + configs[i].pf_window;
+            const std::string key = configs[i].pf + ":" + configs[i].pf_window + ":" + configs[i].pf_rows;
             if (!gi.count(key)) {
                 gi[key] = groups.size();
                 groups.emplace_back();
@@ -345,6 +367,13 @@ int main(int argc, char ** argv) {
         const tail_config & c0 = configs[groups[g][0]];
         unsetenv("LLAMA_SPARSE_DECODE");
         set_prefill_env(c0.pf, c0.pf_window);
+        const std::string rows = c0.pf.empty() ? "" : prefill_rows(c0.pf_rows, n, cp.n_ubatch);
+        if (rows.empty()) {
+            unsetenv("LLAMA_SPARSE_PREFILL_ROWS");
+        } else {
+            setenv("LLAMA_SPARSE_PREFILL_ROWS", rows.c_str(), 1);
+            fprintf(stderr, "prefill %s: LLAMA_SPARSE_PREFILL_ROWS=%s\n", c0.name.c_str(), rows.c_str());
+        }
         llama_memory_clear(mem, true);
         // --dump-configs naming this config: the pf_ tensors and kqv_out of the prefill, the last ubatch's are kept
         ds.active = dump_set.count(c0.name) > 0;
@@ -363,6 +392,7 @@ int main(int argc, char ** argv) {
         }
         ds.active = false;
         set_prefill_env("", "");
+        unsetenv("LLAMA_SPARSE_PREFILL_ROWS");
         snapshot();
     };
 
@@ -420,7 +450,7 @@ int main(int argc, char ** argv) {
                 fprintf(out, "]}\n");
                 fflush(out);
             }
-            fprintf(stderr, "prompt %zu (%d tokens): prefill %.1f s (%s)\n", pi, Pt + 1, t_pre, configs[groups[g][0]].pf.empty() ? "dense" : ("pf:" + configs[groups[g][0]].pf).c_str());
+            fprintf(stderr, "prompt %zu (%d tokens): prefill %.1f s (%s)\n", pi, Pt + 1, t_pre, configs[groups[g][0]].name.c_str());
         }
     }
 
