@@ -9017,9 +9017,10 @@ struct test_flash_attn_ext_pages : public test_case {
     const ggml_type type_KV;
     const bool      shared;  // the q heads of a KV head share their pages
     const bool      list;    // one causal mask row for all heads and the pages as a chunk list (ggml_flash_attn_ext_set_chunk_list)
+    const bool      sinks;   // one sink logit per q head (gpt-oss)
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, gqa, kv, n_pages, type_KV, shared, list);
+        return VARS_TO_STR9(hs, nh, gqa, kv, n_pages, type_KV, shared, list, sinks);
     }
 
     double max_nmse_err() override {
@@ -9032,8 +9033,8 @@ struct test_flash_attn_ext_pages : public test_case {
     }
 
     test_flash_attn_ext_pages(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 4, int64_t kv = 8192, int64_t n_pages = 16,
-                              ggml_type type_KV = GGML_TYPE_F16, bool shared = true, bool list = false)
-        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_pages(n_pages), type_KV(type_KV), shared(shared), list(list) {}
+                              ggml_type type_KV = GGML_TYPE_F16, bool shared = true, bool list = false, bool sinks = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_pages(n_pages), type_KV(type_KV), shared(shared), list(list), sinks(sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, 1, nh*gqa, 1);
@@ -9046,6 +9047,11 @@ struct test_flash_attn_ext_pages : public test_case {
         ggml_set_name(m, "m");
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*gqa);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         ggml_flash_attn_ext_set_n_kv_max(out, int32_t(64*(n_pages + 2)));
         ggml_flash_attn_ext_set_mask_chunked(out, true);
         if (list) {
@@ -13571,6 +13577,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                     }
                 }
+            }
+        }
+    }
+    // head sizes and GQA of current targets: gpt-oss (64, 8 KV heads, GQA 8, sinks), Qwen3.6-35B-A3B (256, 2, 8), Qwen3.8-27B (256, 4, 6)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (bool list : {false, true}) {
+            for (bool shared : {true, false}) {
+                test_cases.emplace_back(new test_flash_attn_ext_pages(64,  8, 8, 32768, 32, type_KV, shared, list, true));
+                test_cases.emplace_back(new test_flash_attn_ext_pages(64,  8, 8, 4096,  7,  type_KV, shared, list, false));
+                test_cases.emplace_back(new test_flash_attn_ext_pages(256, 2, 8, 32768, 32, type_KV, shared, list));
+                test_cases.emplace_back(new test_flash_attn_ext_pages(256, 4, 6, 4096,  7,  type_KV, shared, list));
             }
         }
     }
