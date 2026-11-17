@@ -259,6 +259,23 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
     llama_memory_t mem = llama_get_memory(ctx);
+
+    // recurrent and hybrid memories cannot drop a decoded tail: they restore the sequence state saved after the prefill
+    const bool stateful = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+    std::vector<uint8_t> snap;
+    auto snapshot = [&]() {
+        if (stateful) {
+            snap.resize(llama_state_seq_get_size(ctx, 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx, snap.data(), snap.size(), 0) == snap.size());
+        }
+    };
+    auto rewind = [&](llama_pos p0) {
+        if (!stateful) {
+            return llama_memory_seq_rm(mem, 0, p0, -1);
+        }
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        return llama_state_seq_set_data(ctx, snap.data(), snap.size(), 0) > 0;
+    };
     unsetenv("LLAMA_SPARSE_DECODE");
 
     FILE * out = out_path.empty() ? stdout : fopen(out_path.c_str(), "w");
@@ -292,6 +309,7 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); return 1; }
         }
         const double t_pre = (ggml_time_us() - t0)/1e6;
+        snapshot();
 
         for (const auto & c : configs) {
             if (c.budget > 0) {
@@ -303,7 +321,7 @@ int main(int argc, char ** argv) {
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
-            llama_memory_seq_rm(mem, 0, Pt, -1);
+            if (!rewind(Pt)) { fprintf(stderr, "cannot rewind the memory to %d\n", (int) Pt); return 1; }
 
             std::vector<int32_t> outv;
             int32_t tok = gp.ids[Pt];
@@ -357,6 +375,7 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); return 1; }
         }
         fprintf(stderr, "trial %zu: prefill %d tokens in %.1f s\n", t, Pt, (ggml_time_us() - t0)/1e6);
+        snapshot();
 
         for (const auto & c : configs) {
             if (c.budget > 0) {
@@ -368,7 +387,7 @@ int main(int argc, char ** argv) {
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
-            llama_memory_seq_rm(mem, 0, Pt, -1);
+            if (!rewind(Pt)) { fprintf(stderr, "cannot rewind the memory to %d\n", (int) Pt); return 1; }
 
             int correct = 1;
             double logp = 0.0;
@@ -421,6 +440,7 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); return 1; }
         }
         fprintf(stderr, "book %d: prefill %d tokens in %.1f s\n", b, P, (ggml_time_us() - t0)/1e6);
+        snapshot();
         if (fref) {
             for (int s = 0; s < n_tail; ++s) {
                 if (fread(ref[s].data(), sizeof(float), n_vocab, fref) != (size_t) n_vocab) { fprintf(stderr, "short --ref-logits file\n"); return 1; }
@@ -438,7 +458,7 @@ int main(int argc, char ** argv) {
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
-            llama_memory_seq_rm(mem, 0, P, -1);
+            if (!rewind(P)) { fprintf(stderr, "cannot rewind the memory to %d\n", (int) P); return 1; }
 
             std::vector<double> kl(n_tail);
             int    flips = 0;
