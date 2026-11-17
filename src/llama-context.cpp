@@ -468,13 +468,15 @@ llama_context::llama_context(
 
     // page-sparse decode is implemented on CUDA (fast) and the CPU (reference): all layers and the KV cache on CUDA devices,
     // or a build without GPU devices
-    if (const char * e = getenv("LLAMA_SPARSE_DECODE"); e && atoi(e) > 0 && !hparams.vocab_only) {
+    const char * e_sd = getenv("LLAMA_SPARSE_DECODE");
+    const char * e_sp = getenv("LLAMA_SPARSE_PREFILL");
+    if (((e_sd && atoi(e_sd) > 0) || (e_sp && atof(e_sp) > 0.0)) && !hparams.vocab_only) {
         const bool all_cuda = !model.devices.empty() && std::all_of(model.devices.begin(), model.devices.end(), [](const llama_device & d) {
             return strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d.dev)), "CUDA") == 0;
         });
         const bool cuda_ok = all_cuda && cparams.offload_kqv && model.n_gpu_layers() > model.hparams.n_layer_all;
         if (!cuda_ok && !model.devices.empty()) {
-            throw std::runtime_error("LLAMA_SPARSE_DECODE needs all layers and the KV cache on CUDA devices (CUDA build, -ngl 99, KV offload on), or a CPU-only build");
+            throw std::runtime_error("LLAMA_SPARSE_DECODE and LLAMA_SPARSE_PREFILL need all layers and the KV cache on CUDA devices (CUDA build, -ngl 99, KV offload on), or a CPU-only build");
         }
     }
 
@@ -2937,6 +2939,14 @@ uint32_t llama_context::graph_max_nodes() const {
     // page-sparse decode adds the page statistics and the page selection to every attention layer
     if (getenv("LLAMA_SPARSE_DECODE")) {
         res += 128u*model.hparams.n_layer();
+    }
+    // the sparse prefill emulation adds the block selection and one masked attention per KV head
+    if (getenv("LLAMA_SPARSE_PREFILL")) {
+        uint32_t n_kv_h = 1;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            n_kv_h = std::max(n_kv_h, model.hparams.n_head_kv(il));
+        }
+        res += (48u + 16u*n_kv_h)*model.hparams.n_layer();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

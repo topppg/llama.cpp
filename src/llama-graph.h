@@ -357,6 +357,16 @@ struct llm_sparse_pages {
     int           sp_score     = 0;
     int           sp_fused     = 1;
 
+    // block-sparse prefill emulation (LLAMA_SPARSE_PREFILL), set when a prefill graph uses it
+    ggml_tensor * pf_tmask     = nullptr; // F32 [n_page, n_tokens] 0 for the pages a row may select, else -1e30
+    ggml_tensor * pf_bias      = nullptr; // F32 [n_page + n_dummy, n_qblk] eligibility and dummy picks, added to the block scores
+    ggml_tensor * pf_blocks    = nullptr; // I32 [64, n_page] the cells of each page
+    ggml_tensor * pf_extra     = nullptr; // I32 [n_extra, n_tokens] page 0 and the window cells of each row, -1 padded
+    float         pf_frac      = 0.0f;
+    int64_t       pf_window    = 0;
+    int64_t       pf_top       = 0;  // picks per row, dummies included
+    int64_t       pf_dummy     = 0;
+
     // mask: the f16 kq mask of the cache, already set for this ubatch
     void set_input(const ggml_tensor * mask, const llama_ubatch * ubatch);
     bool can_reuse() const;
@@ -1451,7 +1461,24 @@ const llama_kv_cache_context * mctx_cur,
                            bool   stores_k, // false for a layer that reads another layer's K (shared KV)
                           float   kq_scale,
                             int   il,
-                    ggml_tensor ** chunk_list) const;
+                    ggml_tensor ** chunk_list,
+                    ggml_tensor ** ps_out = nullptr) const; // the page statistics of this layer, or nullptr
+
+    // block-sparse prefill emulation (LLAMA_SPARSE_PREFILL) on one full-attention layer: for a multi-token ubatch, the attention
+    // output [n_embd_head_v*n_head, n_tokens] with the unselected pages of each query block and KV head masked, else nullptr
+    ggml_tensor * build_sparse_prefill(
+                   llm_sparse_pages * sp,
+                    ggml_tensor * q,
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                    ggml_tensor * kq_b,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * kv_rows,
+                    ggml_tensor * sinks,
+                    ggml_tensor * v_mla,
+                    ggml_tensor * ps,
+                          float   kq_scale,
+                            int   il) const;
 
     // page-sparse decode (LLAMA_SPARSE_DECODE): the sparse mask and the FA n_kv_max
     std::pair<ggml_tensor *, int64_t> build_sparse_pages(

@@ -684,6 +684,64 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //   LLAMA_SPARSE_DECODE_FUSED=0|1|2     quest with cached statistics: 1 (default) selects with ggml_page_top_k, 0 with the unfused
 //                                       chain of ops, 2 with ggml_page_top_k and also computes the unfused picks as sp_picks_ref (debug),
 //                                       3 with ggml_page_top_k_chunks: flash attention gathers the listed chunks, no per-head mask
+//
+// block-sparse prefill emulation (experimental, quality only: the masked dense attention is not faster), on the same layers:
+//   LLAMA_SPARSE_PREFILL=<F>            in a multi-token ubatch, each query block (64 rows of the ubatch) of each KV head attends to
+//                                       page 0, the window and the top ceil(F*n) of the n other causal pages; F = 1 keeps every page.
+//                                       Score: the quest bound of each query and query head against the cached page max/min,
+//                                       a softmax over the selectable pages per row, then the max over the block's rows and the
+//                                       KV head's query heads. The other pages are -inf in the mask, flash attention runs per KV head.
+//   LLAMA_SPARSE_PREFILL_WINDOW=<W>     the window: the pages from the one holding cell (block start - W) to the block (default 512)
+//   LLAMA_SPARSE_PREFILL_MIN_CTX=<n>    only caches of at least n cells use it (default 0)
+// Needs flash attention, one sequence whose cell index equals its position, no ALiBi. Composes with LLAMA_SPARSE_DECODE,
+// which then selects from the K written by the sparse prefill.
+static float llama_sparse_prefill_frac() {
+    const char * e = getenv("LLAMA_SPARSE_PREFILL");
+    const float f = e ? (float) atof(e) : 0.0f;
+    GGML_ASSERT(f >= 0.0f && f <= 1.0f && "LLAMA_SPARSE_PREFILL must be in [0, 1]");
+    return f;
+}
+
+static int64_t llama_sparse_prefill_window() {
+    const char * e = getenv("LLAMA_SPARSE_PREFILL_WINDOW");
+    const int64_t w = e ? atoll(e) : 512;
+    GGML_ASSERT(w >= 0 && "LLAMA_SPARSE_PREFILL_WINDOW must be >= 0");
+    return w;
+}
+
+static int64_t llama_sparse_prefill_min_ctx() {
+    const char * e = getenv("LLAMA_SPARSE_PREFILL_MIN_CTX");
+    return e ? atoll(e) : 0;
+}
+
+// per query block b (rows 64b .. 64b + 63 of a ubatch at cells c0 ..): the window starts at page wsp[b], pages 1 .. wsp[b] - 1
+// are selectable and k[b] of them are kept. Every row gets n_top picks: n_top - k[b] dummies (pages >= n_page, skipped) first.
+struct llama_sparse_prefill_plan {
+    int64_t n_qblk = 0;
+    int64_t n_top  = 0;
+    int64_t n_dummy = 0;
+    std::vector<int64_t> wsp;
+    std::vector<int64_t> k;
+};
+
+static llama_sparse_prefill_plan llama_sparse_prefill_make_plan(int64_t c0, int64_t n_tokens, float frac, int64_t window) {
+    llama_sparse_prefill_plan pl;
+    pl.n_qblk = (n_tokens + 63)/64;
+    int64_t k_min = INT64_MAX;
+    for (int64_t b = 0; b < pl.n_qblk; ++b) {
+        const int64_t ws     = c0 + 64*b - window;
+        const int64_t wsp    = ws < 64 ? 1 : ws/64;
+        const int64_t n_elig = wsp - 1;
+        const int64_t k      = std::min<int64_t>(n_elig, (int64_t) std::ceil((double) frac*n_elig - 1e-6));
+        pl.wsp.push_back(wsp);
+        pl.k.push_back(k);
+        pl.n_top = std::max(pl.n_top, k);
+        k_min    = std::min(k_min, k);
+    }
+    pl.n_dummy = pl.n_top - k_min;
+    return pl;
+}
+
 static int llama_sparse_pages_budget() {
     const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
@@ -760,6 +818,64 @@ void llm_sparse_pages::set_input(const ggml_tensor * mask, const llama_ubatch * 
         }
     }
 
+    if (pf_tmask && pf_tmask->buffer) {
+        const int64_t c0 = ubatch->pos[0];
+        const int64_t nt = ubatch->n_tokens;
+        GGML_ASSERT(ubatch->pos[nt - 1] - c0 == nt - 1);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(mask->buffer));
+        llama_sparse_check_mask(mask, c0, sp_checked);
+
+        const llama_sparse_prefill_plan pl = llama_sparse_prefill_make_plan(c0, nt, pf_frac, pf_window);
+        GGML_ASSERT(pl.n_top == pf_top && pl.n_dummy == pf_dummy);
+
+        const int64_t n_page  = pf_tmask->ne[0];
+        const int64_t n_extra = pf_extra->ne[0];
+        GGML_ASSERT(pf_tmask->ne[1] == nt && pf_bias->ne[1] == pl.n_qblk);
+
+        std::vector<float> tm(n_page*nt);
+        std::vector<int32_t> ex(n_extra*nt, -1);
+        for (int64_t t = 0; t < nt; ++t) {
+            const int64_t b   = t/64;
+            const int64_t wsp = pl.wsp[b];
+            for (int64_t p = 0; p < n_page; ++p) {
+                tm[t*n_page + p] = p >= 1 && p < wsp ? 0.0f : -1e30f;
+            }
+            int32_t * row = ex.data() + t*n_extra;
+            int64_t j = 0;
+            for (int64_t c = 0; c < 64; ++c) {
+                row[j++] = (int32_t) c;
+            }
+            for (int64_t c = std::max<int64_t>(64, 64*wsp); c <= c0 + t; ++c) {
+                GGML_ASSERT(j < n_extra);
+                row[j++] = (int32_t) c;
+            }
+        }
+        ggml_backend_tensor_set(pf_tmask, tm.data(), 0, ggml_nbytes(pf_tmask));
+        ggml_backend_tensor_set(pf_extra, ex.data(), 0, ggml_nbytes(pf_extra));
+
+        // block scores are probabilities in [0, 1]: selectable pages +0, the others -2, the first n_top - k[b] dummies +2, the rest -4
+        const int64_t n_col = pf_bias->ne[0];
+        std::vector<float> bias(n_col*pl.n_qblk);
+        for (int64_t b = 0; b < pl.n_qblk; ++b) {
+            for (int64_t p = 0; p < n_col; ++p) {
+                float v;
+                if (p < n_page) {
+                    v = p >= 1 && p < pl.wsp[b] ? 0.0f : -2.0f;
+                } else {
+                    v = p - n_page < pl.n_top - pl.k[b] ? 2.0f : -4.0f;
+                }
+                bias[b*n_col + p] = v;
+            }
+        }
+        ggml_backend_tensor_set(pf_bias, bias.data(), 0, ggml_nbytes(pf_bias));
+
+        std::vector<int32_t> blk(64*n_page);
+        for (int64_t c = 0; c < 64*n_page; ++c) {
+            blk[c] = (int32_t) c;
+        }
+        ggml_backend_tensor_set(pf_blocks, blk.data(), 0, ggml_nbytes(pf_blocks));
+    }
+
     if (sp_page_mask && sp_page_mask->buffer) {
         GGML_ASSERT(ubatch->n_tokens == 1);
         const int64_t pos  = ubatch->pos[0];
@@ -818,7 +934,9 @@ void llm_sparse_pages::set_input(const ggml_tensor * mask, const llama_ubatch * 
 }
 
 bool llm_sparse_pages::can_reuse() const {
-    return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused();
+    // a sparse prefill graph depends on the positions of its ubatch
+    return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused() &&
+        pf_frac == llama_sparse_prefill_frac() && pf_window == llama_sparse_prefill_window() && !pf_tmask;
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -3706,9 +3824,14 @@ ggml_tensor * llm_graph_context::build_attn(
     int64_t       n_kv_max   = 0;
     ggml_tensor * chunk_list = nullptr;
 
-    std::tie(mask, n_kv_max) = build_sparse_decode(inp->sp.get(), mctx_cur, q, k, mask, kv_rows, true, kq_scale, il, &chunk_list);
+    ggml_tensor * ps         = nullptr;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
+    std::tie(mask, n_kv_max) = build_sparse_decode(inp->sp.get(), mctx_cur, q, k, mask, kv_rows, true, kq_scale, il, &chunk_list, &ps);
+
+    ggml_tensor * cur = build_sparse_prefill(inp->sp.get(), q, k, v, kq_b, mask, kv_rows, sinks, v_mla, ps, kq_scale, il);
+    if (!cur) {
+        cur = build_attn_mha(q, k, v, kq_b, mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
@@ -3835,15 +3958,21 @@ const llama_kv_cache_context * mctx_cur,
                    bool   stores_k,
                   float   kq_scale,
                     int   il,
-            ggml_tensor ** chunk_list) const {
+            ggml_tensor ** chunk_list,
+            ggml_tensor ** ps_out) const {
     sp->sp_budget = llama_sparse_pages_budget();
     sp->sp_score  = llama_sparse_pages_score();
     sp->sp_fused  = llama_sparse_pages_fused();
+    sp->pf_frac   = llama_sparse_prefill_frac();
+    sp->pf_window = llama_sparse_prefill_window();
 
     ggml_tensor * ps = nullptr;
     if (mctx_cur->get_ps(il) && !hparams.is_swa(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
         // a layer that reuses another layer's K (shared KV) selects with that layer's statistics, refreshed there
         ps = stores_k ? build_page_stats(sp, k, mctx_cur->get_ps(il), il) : mctx_cur->get_ps(il);
+    }
+    if (ps_out) {
+        *ps_out = ps;
     }
 
     // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size,
@@ -3854,6 +3983,131 @@ const llama_kv_cache_context * mctx_cur,
     }
 
     return {kq_mask, 0};
+}
+
+ggml_tensor * llm_graph_context::build_sparse_prefill(
+               llm_sparse_pages * sp,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * kv_rows,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+        ggml_tensor * ps,
+              float   kq_scale,
+                int   il) const {
+    const int64_t nt = q->ne[2];
+    if (sp->pf_frac <= 0.0f || !ps || nt <= 1 || hparams.is_swa(il) || kv_rows || kq_b || v_mla || !cparams.flash_attn || cparams.training ||
+            hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f || (sinks && (!ggml_is_vector(sinks) || sinks->type != GGML_TYPE_F32)) ||
+            kq_mask->type != GGML_TYPE_F16 || kq_mask->ne[1] != nt || kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 ||
+            k->ne[3] != 1 || k->ne[2] % 64 != 0 || k->ne[2] < llama_sparse_prefill_min_ctx() || v->nb[1] > v->nb[2] ||
+            q->ne[1] % k->ne[1] != 0 || v->ne[1] != k->ne[1]) {
+        return nullptr;
+    }
+
+    const int64_t d      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_kv_h = k->ne[1];
+    const int64_t n_kv   = k->ne[2];
+    const int64_t n_gqa  = n_head/n_kv_h;
+    const int64_t n_page = n_kv/64;
+
+    // a reserve ubatch has no real positions: plan for the deepest one
+    int64_t c0 = ubatch.pos ? ubatch.pos[0] : 0;
+    if (!ubatch.pos || ubatch.pos[nt - 1] - c0 != nt - 1) {
+        c0 = n_kv - nt;
+    }
+    const llama_sparse_prefill_plan pl = llama_sparse_prefill_make_plan(c0, nt, sp->pf_frac, sp->pf_window);
+    if (pl.n_top == 0) {
+        return nullptr; // no query block has a selectable page
+    }
+    const int64_t n_qblk = pl.n_qblk;
+    const int64_t n_top  = pl.n_top;
+    const int64_t n_col  = n_page + pl.n_dummy;
+
+    if (!sp->pf_tmask) {
+        sp->pf_top   = n_top;
+        sp->pf_dummy = pl.n_dummy;
+
+        sp->pf_tmask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_page, nt);
+        ggml_set_input(sp->pf_tmask);
+        ggml_set_name(sp->pf_tmask, "pf_tmask");
+
+        sp->pf_bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_col, n_qblk);
+        ggml_set_input(sp->pf_bias);
+        ggml_set_name(sp->pf_bias, "pf_bias");
+
+        sp->pf_blocks = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 64, n_page);
+        ggml_set_input(sp->pf_blocks);
+        ggml_set_name(sp->pf_blocks, "pf_blocks");
+
+        // page 0, then at most W + 127 window cells up to the row
+        sp->pf_extra = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 64 + sp->pf_window + 128, nt);
+        ggml_set_input(sp->pf_extra);
+        ggml_set_name(sp->pf_extra, "pf_extra");
+    }
+    // the layers of one cache share the inputs
+    GGML_ASSERT(sp->pf_top == n_top && sp->pf_dummy == pl.n_dummy && sp->pf_tmask->ne[0] == n_page && sp->pf_tmask->ne[1] == nt);
+
+    // quest bound of every query row and query head against every page: [n_page, nt, n_head], head h reads KV head h/n_gqa
+    ggml_tensor * qs = ggml_scale(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3)), kq_scale); // [d, nt, n_head]
+    ggml_tensor * qcat = ggml_concat(ctx0, ggml_relu(ctx0, qs), ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, qs))), 0);
+    const size_t  ts    = ggml_element_size(ps);
+    ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+    ggml_tensor * score = ggml_mul_mat(ctx0, stats, qcat);
+    cb(score, "pf_qscore", il);
+
+    // per row: a softmax over its selectable pages; then the max over the 64 rows of each query block (padded rows are 0)
+    score = ggml_soft_max_ext(ctx0, score, sp->pf_tmask, 1.0f, 0.0f);
+    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));                       // [nt, n_page, n_head]
+    if (64*n_qblk > nt) {
+        score = ggml_pad(ctx0, score, 64*n_qblk - nt, 0, 0, 0);
+    }
+    score = ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, 64, 64, 0);                      // [n_qblk, n_page, n_head]
+
+    // and the max over the query heads of each KV head
+    score = ggml_reshape_4d(ctx0, score, n_qblk, n_page, n_gqa, n_kv_h);
+    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));                       // [n_gqa, n_page, n_qblk, n_kv_h]
+    if (n_gqa > 1) {
+        score = ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, n_gqa, n_gqa, 0);
+    }
+    score = ggml_reshape_3d(ctx0, score, n_page, n_qblk, n_kv_h);
+
+    // eligibility and dummies, then the n_top best of each (query block, KV head)
+    if (pl.n_dummy > 0) {
+        score = ggml_pad(ctx0, score, pl.n_dummy, 0, 0, 0);
+    }
+    score = ggml_add(ctx0, score, sp->pf_bias);
+    cb(score, "pf_bscore", il);
+
+    ggml_tensor * picks = ggml_argsort(ctx0, score, GGML_SORT_ORDER_DESC);              // [n_col, n_qblk, n_kv_h]
+    picks = ggml_view_3d(ctx0, picks, n_top, n_qblk, n_kv_h, picks->nb[1], picks->nb[2], 0);
+    // to the rows of each block: through f32, as the CUDA repeat has no i32 path (page indices are exact in f32)
+    picks = ggml_cast(ctx0, picks, GGML_TYPE_F32);
+    picks = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, picks, n_top, 1, n_qblk, n_kv_h), n_top, 64, n_qblk, n_kv_h);
+    picks = ggml_cast(ctx0, picks, GGML_TYPE_I32);
+    picks = ggml_reshape_3d(ctx0, picks, n_top, 64*n_qblk, n_kv_h);
+    cb(picks, "pf_picks", il);
+
+    // one masked flash attention per KV head, so the mask is per KV head and not per query head
+    ggml_tensor * cur = nullptr;
+    for (int64_t h = 0; h < n_kv_h; ++h) {
+        ggml_tensor * pk = ggml_view_3d(ctx0, picks, n_top, nt, 1, picks->nb[1], picks->nb[2], h*picks->nb[2]);
+        ggml_tensor * mk = ggml_top_k_mask(ctx0, kq_mask, pk, nullptr, sp->pf_blocks, sp->pf_extra);
+        cb(mk, ("pf_mask" + std::to_string(h)).c_str(), il);
+
+        ggml_tensor * qh = ggml_view_3d(ctx0, q, d, n_gqa, nt, q->nb[1], q->nb[2], h*n_gqa*q->nb[1]);
+        ggml_tensor * kh = ggml_view_4d(ctx0, k, k->ne[0], 1, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], h*k->nb[1]);
+        ggml_tensor * vh = ggml_view_4d(ctx0, v, v->ne[0], 1, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], h*v->nb[1]);
+        ggml_tensor * sh = sinks ? ggml_view_1d(ctx0, sinks, n_gqa, h*n_gqa*sinks->nb[0]) : nullptr;
+
+        ggml_tensor * oh = build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, 0, kq_scale, il, nullptr); // [dv*n_gqa, nt]
+        cur = cur ? ggml_concat(ctx0, cur, oh, 0) : oh;
+    }
+
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_page_stats(
@@ -4275,11 +4529,15 @@ static ggml_tensor * build_attn_iswa_impl(
 
     int64_t       n_kv_max   = 0;
     ggml_tensor * chunk_list = nullptr;
+    ggml_tensor * cur        = nullptr;
     if (!is_swa && own_mask && !use_kv_cur) {
-        std::tie(kq_mask, n_kv_max) = gctx.build_sparse_decode(inp->sp.get(), mctx_cur, q, k, kq_mask, kv_rows, store_kv && k_cur, kq_scale, il, &chunk_list);
+        ggml_tensor * ps = nullptr;
+        std::tie(kq_mask, n_kv_max) = gctx.build_sparse_decode(inp->sp.get(), mctx_cur, q, k, kq_mask, kv_rows, store_kv && k_cur, kq_scale, il, &chunk_list, &ps);
+        cur = gctx.build_sparse_prefill(inp->sp.get(), q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, ps, kq_scale, il);
     }
-
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
+    if (!cur) {
+        cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, n_kv_max, kq_scale, il, chunk_list);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
