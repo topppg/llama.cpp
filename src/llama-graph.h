@@ -362,7 +362,8 @@ struct llm_sparse_pages {
     ggml_tensor * pf_bias      = nullptr; // F32 [n_page + n_dummy, n_qblk] eligibility and dummy picks, added to the block scores
     ggml_tensor * pf_blocks    = nullptr; // I32 [64, n_page] the cells of each page
     ggml_tensor * pf_extra     = nullptr; // I32 [n_extra, n_tokens] page 0 and the window cells of each row, -1 padded
-    float         pf_frac      = 0.0f;
+    double        pf_frac      = 0.0;
+    bool          pf_seen      = false; // a multi-token graph was built with the sparse prefill enabled
     int64_t       pf_window    = 0;
     int64_t       pf_top       = 0;  // picks per row, dummies included
     int64_t       pf_dummy     = 0;

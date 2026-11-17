@@ -697,9 +697,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //                                       (hi may be empty: no upper limit). The page picks of a block still use all its rows.
 // Needs flash attention, one sequence whose cell index equals its position, no ALiBi. Composes with LLAMA_SPARSE_DECODE,
 // which then selects from the K written by the sparse prefill.
-static float llama_sparse_prefill_frac() {
+static double llama_sparse_prefill_frac() {
     const char * e = getenv("LLAMA_SPARSE_PREFILL");
-    const float f = e ? (float) atof(e) : 0.0f;
+    const double f = e ? atof(e) : 0.0;
     GGML_ASSERT(f >= 0.0f && f <= 1.0f && "LLAMA_SPARSE_PREFILL must be in [0, 1]");
     return f;
 }
@@ -740,7 +740,7 @@ struct llama_sparse_prefill_plan {
     std::vector<int64_t> k;
 };
 
-static llama_sparse_prefill_plan llama_sparse_prefill_make_plan(int64_t c0, int64_t n_tokens, float frac, int64_t window) {
+static llama_sparse_prefill_plan llama_sparse_prefill_make_plan(int64_t c0, int64_t n_tokens, double frac, int64_t window) {
     llama_sparse_prefill_plan pl;
     pl.n_qblk = (n_tokens + 63)/64;
     int64_t k_min = INT64_MAX;
@@ -748,7 +748,8 @@ static llama_sparse_prefill_plan llama_sparse_prefill_make_plan(int64_t c0, int6
         const int64_t ws     = c0 + 64*b - window;
         const int64_t wsp    = ws < 64 ? 1 : ws/64;
         const int64_t n_elig = wsp - 1;
-        const int64_t k      = std::min<int64_t>(n_elig, (int64_t) std::ceil((double) frac*n_elig - 1e-6));
+        // ceil(F*n), at least one page; the 1e-9 only absorbs double rounding of an exact product (0.1*30)
+        const int64_t k      = n_elig > 0 ? std::clamp<int64_t>((int64_t) std::ceil(frac*n_elig - 1e-9), 1, n_elig) : 0;
         pl.wsp.push_back(wsp);
         pl.k.push_back(k);
         pl.n_top = std::max(pl.n_top, k);
@@ -950,10 +951,10 @@ void llm_sparse_pages::set_input(const ggml_tensor * mask, const llama_ubatch * 
 }
 
 bool llm_sparse_pages::can_reuse() const {
-    // a sparse prefill graph depends on the positions of its ubatch
+    // a multi-token graph built with the sparse prefill enabled depends on the positions of its ubatch, even when it fell back
+    // to dense attention (nothing selectable yet, rows outside LLAMA_SPARSE_PREFILL_ROWS): never reused
     return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused() &&
-        pf_frac == llama_sparse_prefill_frac() && pf_window == llama_sparse_prefill_window() && !pf_tmask &&
-        (pf_frac == 0.0f || !getenv("LLAMA_SPARSE_PREFILL_ROWS"));
+        pf_frac == llama_sparse_prefill_frac() && pf_window == llama_sparse_prefill_window() && !pf_seen;
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -4016,7 +4017,10 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
               float   kq_scale,
                 int   il) const {
     const int64_t nt = q->ne[2];
-    if (sp->pf_frac <= 0.0f || !ps || nt <= 1 || hparams.is_swa(il) || kv_rows || kq_b || v_mla || !cparams.flash_attn || cparams.training ||
+    if (sp->pf_frac > 0.0 && nt > 1) {
+        sp->pf_seen = true;
+    }
+    if (sp->pf_frac <= 0.0 || !ps || nt <= 1 || hparams.is_swa(il) || kv_rows || kq_b || v_mla || !cparams.flash_attn || cparams.training ||
             hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f || (sinks && (!ggml_is_vector(sinks) || sinks->type != GGML_TYPE_F32)) ||
             kq_mask->type != GGML_TYPE_F16 || kq_mask->ne[1] != nt || kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 ||
             k->ne[3] != 1 || k->ne[2] % 64 != 0 || k->ne[2] < llama_sparse_prefill_min_ctx() || v->nb[1] > v->nb[2] ||

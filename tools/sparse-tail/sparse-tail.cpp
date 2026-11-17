@@ -3,7 +3,7 @@
 // and score:budget:f0|f1|f2|f3 also LLAMA_SPARSE_DECODE_FUSED (without the suffix the variable is left as it is).
 // A config pf:F[:W] sets LLAMA_SPARSE_PREFILL=F (and LLAMA_SPARSE_PREFILL_WINDOW=W) during the prefill, with dense decode;
 // pf:F[:W]+score:budget[:fN] combines both. Configs with the same prefill share one prefill.
-// pf:F:W:R limits the sparse query rows of a prefill of n tokens (LLAMA_SPARSE_PREFILL_ROWS): R = d<N> keeps the last N
+// pf:F[:W][:R] limits the sparse query rows of a prefill of n tokens (LLAMA_SPARSE_PREFILL_ROWS): R = d<N> keeps the last N
 // rows dense, s<N> makes only the last N rows sparse, du keeps the last ubatch dense.
 
 #include "llama.h"
@@ -40,6 +40,10 @@ static std::string prefill_rows(const std::string & r, int n, int n_ubatch) {
     }
     const int m = std::max(0, n - std::stoi(r.substr(1)));
     return r[0] == 'd' ? "0:" + std::to_string(m) : std::to_string(m) + ":";
+}
+
+static bool is_rows_selector(const std::string & r) {
+    return r == "du" || (r.size() > 1 && (r[0] == 'd' || r[0] == 's') && strspn(r.c_str() + 1, "0123456789") == r.size() - 1);
 }
 
 static void set_prefill_env(const std::string & pf, const std::string & window) {
@@ -201,15 +205,15 @@ int main(int argc, char ** argv) {
                 const double f = std::stod(p[1]);
                 if (!(f > 0.0 && f <= 1.0) || p.size() > 4) { fprintf(stderr, "bad config %s\n", c.c_str()); return 1; }
                 tc.pf = p[1];
-                if (p.size() > 2) {
-                    tc.pf_window = p[2];
-                }
-                if (p.size() > 3) {
-                    const std::string & r = p[3];
-                    if (r != "du" && !(r.size() > 1 && (r[0] == 'd' || r[0] == 's') && strspn(r.c_str() + 1, "0123456789") == r.size() - 1)) {
+                // pf:F, pf:F:W, pf:F:R or pf:F:W:R with W a number of cells and R a row selector
+                for (size_t j = 2; j < p.size(); ++j) {
+                    if (j == p.size() - 1 && is_rows_selector(p[j])) {
+                        tc.pf_rows = p[j];
+                    } else if (j == 2 && !p[j].empty() && strspn(p[j].c_str(), "0123456789") == p[j].size()) {
+                        tc.pf_window = p[j];
+                    } else {
                         fprintf(stderr, "bad config %s\n", c.c_str()); return 1;
                     }
-                    tc.pf_rows = r;
                 }
                 continue;
             }
@@ -380,6 +384,7 @@ int main(int argc, char ** argv) {
         ds.with_k = false;
         ds.prefix = "prefill_" + c0.name;
         std::replace(ds.prefix.begin(), ds.prefix.end(), ':', '-');
+        const int32_t n_reused0 = llama_perf_context(ctx).n_reused;
         for (int i = 0; i < n; i += cp.n_batch) {
             const int m = std::min<int>(cp.n_batch, n - i);
             llama_batch_ext_clear(batch);
@@ -391,6 +396,10 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); exit(1); }
         }
         ds.active = false;
+        const int32_t n_reused = llama_perf_context(ctx).n_reused - n_reused0;
+        if (n_reused > 0) {
+            fprintf(stderr, "prefill %s: %d graphs reused\n", c0.name.c_str(), n_reused);
+        }
         set_prefill_env("", "");
         unsetenv("LLAMA_SPARSE_PREFILL_ROWS");
         snapshot();
@@ -590,6 +599,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    fprintf(stderr, "graphs reused in total: %d\n", llama_perf_context(ctx).n_reused);
     if (fref) fclose(fref);
     for (auto & [c, f] : fsave) fclose(f);
     llama_batch_ext_free(batch);
