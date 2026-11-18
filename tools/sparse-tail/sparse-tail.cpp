@@ -367,6 +367,7 @@ int main(int argc, char ** argv) {
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
 
     std::string pf_counts = "{}"; // the sparse prefill counts of the last prefill, as JSON
+    double t_compute = 0.0;       // the last prefill's decode calls up to a device synchronize, without the state snapshot
     // prefill of ids[0 .. n) under the prefill setting of group g, then the state saved for the rewinds
     auto prefill = [&](const int32_t * ids, int n, size_t g) {
         const tail_config & c0 = configs[groups[g][0]];
@@ -387,6 +388,7 @@ int main(int argc, char ** argv) {
         std::replace(ds.prefix.begin(), ds.prefix.end(), ':', '-');
         const int32_t n_reused0 = llama_perf_context(ctx).n_reused;
         llama_sparse_prefill_counts_get(true);
+        const int64_t tc0 = ggml_time_us();
         for (int i = 0; i < n; i += cp.n_batch) {
             const int m = std::min<int>(cp.n_batch, n - i);
             llama_batch_ext_clear(batch);
@@ -397,6 +399,8 @@ int main(int argc, char ** argv) {
             }
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); exit(1); }
         }
+        llama_synchronize(ctx);
+        t_compute = (ggml_time_us() - tc0)/1e6;
         ds.active = false;
         {
             const llama_sparse_prefill_counts pc = llama_sparse_prefill_counts_get(true);
@@ -465,7 +469,7 @@ int main(int argc, char ** argv) {
                 }
                 ds.active = false;
                 const double t_gen = (ggml_time_us() - t1)/1e6;
-                fprintf(out, "{\"id\": %d, \"config\": \"%s\", \"len\": %d, \"prefill_s\": %.3f, \"gen_s\": %.3f, \"pf\": %s, \"out\": [", gp.id, c.name.c_str(), Pt + 1, t_pre, t_gen, pf_counts.c_str());
+                fprintf(out, "{\"id\": %d, \"config\": \"%s\", \"len\": %d, \"prefill_s\": %.3f, \"prefill_compute_s\": %.3f, \"gen_s\": %.3f, \"pf\": %s, \"out\": [", gp.id, c.name.c_str(), Pt + 1, t_pre, t_compute, t_gen, pf_counts.c_str());
                 for (size_t i = 0; i < outv.size(); ++i) fprintf(out, "%s%d", i ? ", " : "", outv[i]);
                 fprintf(out, "]}\n");
                 fflush(out);
