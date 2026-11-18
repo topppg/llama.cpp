@@ -1220,7 +1220,10 @@ void launch_fattn(
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+        // rows that share their selection in aligned groups of a multiple of ncols1 have a union of at most n_kv_max_query
+        const int32_t n_rows_shared = ggml_get_op_params_i32(KQV, 6);
+        const bool    union_bound   = ncols1 > 1 && n_rows_shared > 0 && n_rows_shared % ncols1 == 0;
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(union_bound ? 1 : ncols1)*n_kv_max_query);
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 

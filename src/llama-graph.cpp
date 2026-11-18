@@ -732,6 +732,13 @@ static int64_t llama_sparse_prefill_min_ctx() {
     return e ? atoll(e) : 0;
 }
 
+// LLAMA_SPARSE_PREFILL_GATHER=1: the masked attentions of the emulation declare their selection (n_kv_max, shared by the
+// 64 rows of a query block), so a backend with a sparse gather computes only the selected cells
+static bool llama_sparse_prefill_gather() {
+    const char * e = getenv("LLAMA_SPARSE_PREFILL_GATHER");
+    return e && atoi(e) != 0;
+}
+
 // per query block b (rows 64b .. 64b + 63 of a ubatch at cells c0 ..): the window starts at page wsp[b], pages 1 .. wsp[b] - 1
 // are selectable and k[b] of them are kept. Every row gets n_top picks: n_top - k[b] dummies (pages >= n_page, skipped) first.
 struct llama_sparse_prefill_plan {
@@ -3517,7 +3524,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il,
-         ggml_tensor * chunk_list) const {
+         ggml_tensor * chunk_list,
+             int32_t   n_kv_max_rows) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3564,6 +3572,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        ggml_flash_attn_ext_set_n_kv_max_rows(cur, n_kv_max > 0 ? n_kv_max_rows : 0);
         // one mask per head with an n_kv_max only comes from page-sparse decode, whose masks are whole 64-cell pages
         ggml_flash_attn_ext_set_mask_chunked(cur, n_kv_max > 0 && kq_mask && kq_mask->ne[2] > 1);
         if (chunk_list) {
@@ -4183,6 +4192,10 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
     picks = ggml_reshape_3d(ctx0, picks, n_top, 64*n_qblk, n_kv_h);
     cb(picks, "pf_picks", il);
 
+    // finite cells of a row, and of the union of a query block's rows: n_top pages, page 0 and at most W + 127 window cells
+    const bool    gather   = llama_sparse_prefill_gather();
+    const int64_t n_kv_sel = gather ? std::min<int64_t>(n_kv, 64*n_top + 64 + sp->pf_window + 128) : 0;
+
     // one masked flash attention per KV head, so the mask is per KV head and not per query head
     ggml_tensor * cur = nullptr;
     for (int64_t h = 0; h < n_kv_h; ++h) {
@@ -4195,7 +4208,7 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
         ggml_tensor * vh = ggml_view_4d(ctx0, v, v->ne[0], 1, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], h*v->nb[1]);
         ggml_tensor * sh = sinks ? ggml_view_1d(ctx0, sinks, n_gqa, h*n_gqa*sinks->nb[0]) : nullptr;
 
-        ggml_tensor * oh = build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, 0, kq_scale, il, nullptr); // [dv*n_gqa, nt]
+        ggml_tensor * oh = build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, n_kv_sel, kq_scale, il, nullptr, gather ? 64 : 0); // [dv*n_gqa, nt]
         cur = cur ? ggml_concat(ctx0, cur, oh, 0) : oh;
     }
 

@@ -9073,6 +9073,96 @@ struct test_leaky_relu : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT, a prefill ubatch of nt rows at the end of the cache with a block-sparse mask (sparse prefill):
+// each 64-row query block keeps page 0, n_top random pages before its window and a causal window of W cells,
+// with n_kv_max bounding the union of each block's rows (ggml_flash_attn_ext_set_n_kv_max_rows)
+struct test_flash_attn_ext_blocks : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;     // KV heads
+    const int64_t   gqa;    // q heads per KV head
+    const int64_t   kv;
+    const int64_t   nt;
+    const int64_t   n_top;
+    const int64_t   W;
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, gqa, kv, nt, n_top, W, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    int64_t n_kv_sel() const {
+        return std::min<int64_t>(kv, 64*n_top + 64 + W + 128);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * nt * nh*gqa * n_kv_sel() * hs;
+    }
+
+    test_flash_attn_ext_blocks(int64_t hs = 256, int64_t nh = 1, int64_t gqa = 8, int64_t kv = 16384, int64_t nt = 512,
+                               int64_t n_top = 24, int64_t W = 512, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nt(nt), n_top(n_top), W(W), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nt, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nt, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, int32_t(n_kv_sel()));
+        ggml_flash_attn_ext_set_n_kv_max_rows(out, 64);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t c0 = kv - nt;
+            std::mt19937 gen(0xB10C);
+            std::vector<float> f(kv*nt, -INFINITY);
+            for (int64_t b = 0; b < nt/64; ++b) {
+                const int64_t ws  = c0 + 64*b - W;
+                const int64_t wsp = ws < 64 ? 1 : ws/64;
+                std::vector<int64_t> pages;
+                for (int64_t p = 1; p < wsp; ++p) {
+                    pages.push_back(p);
+                }
+                std::shuffle(pages.begin(), pages.end(), gen);
+                pages.resize(std::min<int64_t>(n_top, pages.size()));
+                pages.push_back(0);
+                for (int64_t r = 64*b; r < 64*b + 64; ++r) {
+                    float * row = f.data() + r*kv;
+                    for (int64_t p : pages) {
+                        for (int64_t c = 64*p; c < 64*p + 64; ++c) {
+                            row[c] = -0.03125f * float(1 + (c + r) % 7);
+                        }
+                    }
+                    for (int64_t c = std::max<int64_t>(0, 64*wsp); c <= c0 + r; ++c) {
+                        row[c] = -0.03125f * float(1 + (c + r) % 5);
+                    }
+                }
+            }
+            std::vector<ggml_fp16_t> h(f.size());
+            ggml_fp32_to_fp16_row(f.data(), h.data(), h.size());
+            ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT, one decode token with one mask per q head made of 64-cell pages (page-sparse decode)
 // every row keeps page 0, n_pages random pages and a last page cut off part-way, like the recent window
 struct test_flash_attn_ext_pages : public test_case {
@@ -13781,6 +13871,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext_pages(256, 4, 6, 4096,  7,  type_KV, shared, list));
             }
         }
+    }
+
+    // sparse prefill: block-sparse masks whose 64-row blocks share their selection (Qwen3.6: 2 KV heads x 8, Qwen3.8: 4 x 6)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 2, 8, 16384, 512, 24, 512, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 4, 6, 16384, 512, 24, 512, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 1, 8, 8192,  256, 3,  512, type_KV));
     }
 
     // sparse mask with large batch size

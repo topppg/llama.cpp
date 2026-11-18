@@ -1379,7 +1379,8 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il,
-            ggml_tensor * chunk_list = nullptr) const; // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
+            ggml_tensor * chunk_list = nullptr, // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
+                int32_t   n_kv_max_rows = 0) const; // see ggml_flash_attn_ext_set_n_kv_max_rows
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

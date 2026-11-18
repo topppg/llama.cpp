@@ -150,7 +150,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
-    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+    const int32_t n_rows_shared = ggml_get_op_params_i32(dst, 6);
+    const bool    union_bound   = ncols1 > 1 && n_rows_shared > 0 && n_rows_shared % ncols1 == 0;
+    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : union_bound ? 1 : ncols1) * (int64_t) n_kv_max;
 
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&

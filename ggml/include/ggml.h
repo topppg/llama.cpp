@@ -2283,6 +2283,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Promise that n_kv_max also bounds the union of the finite entries of every n_rows consecutive mask rows
+    // starting at a multiple of n_rows (rows of a block share their selection). Set 0 to disable.
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max_rows(
+            struct ggml_tensor * a,
+            int32_t              n_rows);
+
     // Attend only to the cells of listed chunks of 32 cells; the mask still applies to them. Needs n_kv_max >= 32*n of every row.
     // list: [n_kv/32 + 1, n_head, n_seq] i32, row = [n, c_0 < c_1 < ... < c_{n-1}] (n_head, n_seq as in q)
     GGML_API void ggml_flash_attn_ext_set_chunk_list(
