@@ -1173,13 +1173,15 @@ void launch_fattn(
         mask = &ps_mask;
     }
 
-    ggml_cuda_pool_alloc<int>    KV_max(pool);
-    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    // pool buffers are freed in reverse declaration order, which must be the reverse of their allocation order:
+    // KV_max, then ps_flags (both before the conversion), then dst_tmp and dst_tmp_meta
+    ggml_cuda_pool_alloc<int>      KV_max(pool);
+    ggml_cuda_pool_alloc<uint32_t> ps_flags(pool);
+    ggml_cuda_pool_alloc<float>    dst_tmp(pool);
+    ggml_cuda_pool_alloc<float2>   dst_tmp_meta(pool);
 
     bool ps_convert = false;
     const int64_t ps_n_page = (K->ne[1] + 63)/64;
-    ggml_cuda_pool_alloc<uint32_t> ps_flags(pool);
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
