@@ -734,9 +734,13 @@ static int64_t llama_sparse_prefill_min_ctx() {
 
 // LLAMA_SPARSE_PREFILL_GATHER=1: the masked attentions of the emulation declare their selection (n_kv_max, shared by the
 // 64 rows of a query block), so a backend with a sparse gather computes only the selected cells
-static bool llama_sparse_prefill_gather() {
+// LLAMA_SPARSE_PREFILL_GATHER=2: as 1, but the per-KV-head masks are not built: the attentions get the causal mask and the
+// picks (ggml_flash_attn_ext_set_page_select), and a backend with a sparse gather lists the cells from the picks directly
+static int llama_sparse_prefill_gather() {
     const char * e = getenv("LLAMA_SPARSE_PREFILL_GATHER");
-    return e && atoi(e) != 0;
+    const int g = e ? atoi(e) : 0;
+    GGML_ASSERT(g >= 0 && g <= 2 && "LLAMA_SPARSE_PREFILL_GATHER must be 0, 1 or 2");
+    return g;
 }
 
 // per query block b (rows 64b .. 64b + 63 of a ubatch at cells c0 ..): the window starts at page wsp[b], pages 1 .. wsp[b] - 1
@@ -3525,7 +3529,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * chunk_list,
-             int32_t   n_kv_max_rows) const {
+             int32_t   n_kv_max_rows,
+         ggml_tensor * ps_picks,
+         ggml_tensor * ps_blocks,
+         ggml_tensor * ps_extra) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3577,6 +3584,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_mask_chunked(cur, n_kv_max > 0 && kq_mask && kq_mask->ne[2] > 1);
         if (chunk_list) {
             ggml_flash_attn_ext_set_chunk_list(cur, chunk_list);
+        }
+        if (ps_picks) {
+            ggml_flash_attn_ext_set_page_select(cur, ps_picks, ps_blocks, ps_extra);
         }
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
@@ -4193,22 +4203,28 @@ ggml_tensor * llm_graph_context::build_sparse_prefill(
     cb(picks, "pf_picks", il);
 
     // finite cells of a row, and of the union of a query block's rows: n_top pages, page 0 and at most W + 127 window cells
-    const bool    gather   = llama_sparse_prefill_gather();
+    const int     gather   = llama_sparse_prefill_gather();
     const int64_t n_kv_sel = gather ? std::min<int64_t>(n_kv, 64*n_top + 64 + sp->pf_window + 128) : 0;
 
     // one masked flash attention per KV head, so the mask is per KV head and not per query head
     ggml_tensor * cur = nullptr;
     for (int64_t h = 0; h < n_kv_h; ++h) {
         ggml_tensor * pk = ggml_view_3d(ctx0, picks, n_top, nt, 1, picks->nb[1], picks->nb[2], h*picks->nb[2]);
-        ggml_tensor * mk = ggml_top_k_mask(ctx0, kq_mask, pk, nullptr, sp->pf_blocks, sp->pf_extra);
-        cb(mk, ("pf_mask" + std::to_string(h)).c_str(), il);
+        ggml_tensor * mk = kq_mask;
+        if (gather < 2) {
+            mk = ggml_top_k_mask(ctx0, kq_mask, pk, nullptr, sp->pf_blocks, sp->pf_extra);
+            cb(mk, ("pf_mask" + std::to_string(h)).c_str(), il);
+        }
 
         ggml_tensor * qh = ggml_view_3d(ctx0, q, d, n_gqa, nt, q->nb[1], q->nb[2], h*n_gqa*q->nb[1]);
         ggml_tensor * kh = ggml_view_4d(ctx0, k, k->ne[0], 1, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], h*k->nb[1]);
         ggml_tensor * vh = ggml_view_4d(ctx0, v, v->ne[0], 1, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], h*v->nb[1]);
         ggml_tensor * sh = sinks ? ggml_view_1d(ctx0, sinks, n_gqa, h*n_gqa*sinks->nb[0]) : nullptr;
 
-        ggml_tensor * oh = build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, n_kv_sel, kq_scale, il, nullptr, gather ? 64 : 0); // [dv*n_gqa, nt]
+        ggml_tensor * oh = gather < 2 ?
+            build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, n_kv_sel, kq_scale, il, nullptr, gather ? 64 : 0) :
+            build_attn_mha(qh, kh, vh, nullptr, mk, nullptr, sh, nullptr, n_kv_sel, kq_scale, il, nullptr, 64,
+                           pk, sp->pf_blocks, sp->pf_extra); // [dv*n_gqa, nt]
         cur = cur ? ggml_concat(ctx0, cur, oh, 0) : oh;
     }
 

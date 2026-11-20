@@ -1380,7 +1380,10 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * chunk_list = nullptr, // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
-                int32_t   n_kv_max_rows = 0) const; // see ggml_flash_attn_ext_set_n_kv_max_rows
+                int32_t   n_kv_max_rows = 0,  // see ggml_flash_attn_ext_set_n_kv_max_rows
+            ggml_tensor * ps_picks  = nullptr, // page select, see ggml_flash_attn_ext_set_page_select
+            ggml_tensor * ps_blocks = nullptr,
+            ggml_tensor * ps_extra  = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
