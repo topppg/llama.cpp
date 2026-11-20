@@ -9163,6 +9163,136 @@ struct test_flash_attn_ext_blocks : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with page select (ggml_flash_attn_ext_set_page_select), the sparse prefill without built masks:
+// a causal mask (with a few -inf holes), per-row picks shared by each 64-row block (with dummies past the last page),
+// 64-cell page blocks, and extra cells = page 0 + the block's window up to the row. With materialise the same selection
+// goes through ggml_top_k_mask and a masked attention instead (the old path).
+struct test_flash_attn_ext_page_select : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;     // KV heads
+    const int64_t   gqa;    // q heads per KV head
+    const int64_t   kv;
+    const int64_t   nt;
+    const int64_t   n_top;
+    const int64_t   W;
+    const ggml_type type_KV;
+    const bool      materialise;
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, nh, gqa, kv, nt, n_top, W, type_KV, materialise);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    int64_t n_page() const { return kv/64; }
+    int64_t n_extra() const { return 64 + W + 128; }
+
+    int64_t n_kv_sel() const {
+        return std::min<int64_t>(kv, 64*n_top + 64 + W + 128);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * nt * nh*gqa * n_kv_sel() * hs;
+    }
+
+    test_flash_attn_ext_page_select(int64_t hs = 256, int64_t nh = 1, int64_t gqa = 8, int64_t kv = 16384, int64_t nt = 512,
+                                    int64_t n_top = 24, int64_t W = 512, ggml_type type_KV = GGML_TYPE_F16, bool materialise = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nt(nt), n_top(n_top), W(W), type_KV(type_KV), materialise(materialise) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nt, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nt, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * picks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, nt);
+        ggml_set_name(picks, "picks");
+        ggml_tensor * blocks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 64, n_page());
+        ggml_set_name(blocks, "blocks");
+        ggml_tensor * extra = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_extra(), nt);
+        ggml_set_name(extra, "extra");
+
+        ggml_tensor * mask = materialise ? ggml_top_k_mask(ctx, m, picks, nullptr, blocks, extra) : m;
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, int32_t(n_kv_sel()));
+        ggml_flash_attn_ext_set_n_kv_max_rows(out, 64);
+        if (!materialise) {
+            ggml_flash_attn_ext_set_page_select(out, picks, blocks, extra);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t c0 = kv - nt;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<float> f(kv*nt, -INFINITY);
+                for (int64_t r = 0; r < nt; ++r) {
+                    for (int64_t c = 0; c <= c0 + r; ++c) {
+                        f[r*kv + c] = (c*7 + r) % 97 == 0 ? -INFINITY : -0.03125f * float(1 + (c + r) % 7);
+                    }
+                }
+                std::vector<ggml_fp16_t> h(f.size());
+                ggml_fp32_to_fp16_row(f.data(), h.data(), h.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "picks") == 0) {
+                std::mt19937 gen(0x5E1C);
+                std::vector<int32_t> pk(n_top*nt);
+                for (int64_t b = 0; b < (nt + 63)/64; ++b) {
+                    const int64_t ws  = c0 + 64*b - W;
+                    const int64_t wsp = ws < 64 ? 1 : ws/64;
+                    std::vector<int32_t> pages;
+                    for (int64_t p = 1; p < wsp; ++p) {
+                        pages.push_back(int32_t(p));
+                    }
+                    std::shuffle(pages.begin(), pages.end(), gen);
+                    pages.resize(std::min<int64_t>(n_top, pages.size()));
+                    // dummies past the last page, as the sparse prefill pads blocks with fewer eligible pages
+                    while ((int64_t) pages.size() < n_top) {
+                        pages.insert(pages.begin(), int32_t(n_page() + pages.size()));
+                    }
+                    for (int64_t r = 64*b; r < std::min<int64_t>(64*b + 64, nt); ++r) {
+                        std::copy(pages.begin(), pages.end(), pk.begin() + r*n_top);
+                    }
+                }
+                ggml_backend_tensor_set(t, pk.data(), 0, pk.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "blocks") == 0) {
+                std::vector<int32_t> blk(64*n_page());
+                for (int64_t c = 0; c < 64*n_page(); ++c) {
+                    blk[c] = int32_t(c);
+                }
+                ggml_backend_tensor_set(t, blk.data(), 0, blk.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "extra") == 0) {
+                std::vector<int32_t> ex(n_extra()*nt, -1);
+                for (int64_t r = 0; r < nt; ++r) {
+                    const int64_t b   = r/64;
+                    const int64_t ws  = c0 + 64*b - W;
+                    const int64_t wsp = ws < 64 ? 1 : ws/64;
+                    int32_t * row = ex.data() + r*n_extra();
+                    int64_t j = 0;
+                    for (int64_t c = 0; c < 64; ++c) {
+                        row[j++] = int32_t(c);
+                    }
+                    for (int64_t c = std::max<int64_t>(64, 64*wsp); c <= c0 + r && j < n_extra(); ++c) {
+                        row[j++] = int32_t(c);
+                    }
+                }
+                ggml_backend_tensor_set(t, ex.data(), 0, ex.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT, one decode token with one mask per q head made of 64-cell pages (page-sparse decode)
 // every row keeps page 0, n_pages random pages and a last page cut off part-way, like the recent window
 struct test_flash_attn_ext_pages : public test_case {
@@ -13878,6 +14008,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 2, 8, 16384, 512, 24, 512, type_KV));
         test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 4, 6, 16384, 512, 24, 512, type_KV));
         test_cases.emplace_back(new test_flash_attn_ext_blocks(256, 1, 8, 8192,  256, 3,  512, type_KV));
+    }
+
+    // sparse prefill with page select (no built masks), and the same selection through ggml_top_k_mask; head size 64 has
+    // no sparse MMA variant and takes the fallback that builds the mask
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (bool materialise : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 2, 8, 16384, 512, 24, 512, type_KV, materialise));
+            test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 4, 6, 16384, 512, 24, 512, type_KV, materialise));
+            test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 1, 8, 8192,  256, 3,  512, type_KV, materialise));
+            test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 1, 8, 8192,  196, 3,  512, type_KV, materialise));
+            test_cases.emplace_back(new test_flash_attn_ext_page_select(64,  2, 4, 16384, 512, 24, 512, type_KV, materialise));
+        }
     }
 
     // sparse mask with large batch size
