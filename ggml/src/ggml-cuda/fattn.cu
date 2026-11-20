@@ -127,6 +127,147 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_MUSA)
 }
 
+#if !defined(GGML_USE_MUSA)
+// page select: the lists of flash_attn_mask_to_sparse_indices for the mask that ggml_top_k_mask(mask, picks, NULL, blocks, extra)
+// would build, without building it. One block per group of ncols1 queries: a bitmap over the cells marks every cell that some
+// query of the group selects and sees (finite mask entry), then the marked cells are written in ascending order.
+template <int ncols1>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_picks_to_sparse_indices(
+        const half * mask_ptr, const int32_t * picks, const int32_t * blocks, const int32_t * extra,
+        int32_t * indices_ptr, int32_t * counts_ptr,
+        const int n_kv, const int n_queries, const int n_kv_max,
+        const int n_top, const int n_blk, const int n_page, const int n_extra,
+        const int64_t s31, const int64_t s33,
+        const int64_t sp0, const int64_t sp1, const int64_t sp3,
+        const int64_t sb0, const int64_t sb1,
+        const int64_t se0, const int64_t se1, const int64_t se3) {
+    ggml_cuda_pdl_sync();
+
+    extern __shared__ uint32_t bitmap[];
+    __shared__ int thread_offsets[256];
+
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int group    = blockIdx.x;
+    const int n_words  = (n_kv + 31)/32;
+
+    for (int w = tid; w < n_words; w += blockDim.x) {
+        bitmap[w] = 0;
+    }
+    __syncthreads();
+
+    const int q0 = group*ncols1;
+    const int q1 = min(q0 + ncols1, n_queries);
+    const int n_pick_cells = n_top*n_blk;
+    for (int q = q0; q < q1; ++q) {
+        const half    * mask_row  = mask_ptr + sequence*s33 + q*s31;
+        const int32_t * picks_row = picks + q*sp1 + sequence*sp3;
+        const int32_t * extra_row = extra + q*se1 + sequence*se3;
+        for (int item = tid; item < n_pick_cells + n_extra; item += blockDim.x) {
+            int32_t c;
+            if (item < n_pick_cells) {
+                const int32_t p = picks_row[(item / n_blk)*sp0];
+                if (p < 0 || p >= n_page) {
+                    continue;
+                }
+                c = blocks[(item % n_blk)*sb0 + p*sb1];
+            } else {
+                c = extra_row[(item - n_pick_cells)*se0];
+            }
+            if (c >= 0 && c < n_kv && isfinite(__half2float(mask_row[c]))) {
+                atomicOr(&bitmap[c/32], 1u << (c % 32));
+            }
+        }
+    }
+    __syncthreads();
+
+    // contiguous word ranges per thread, so a prefix sum over the threads keeps the cells in ascending order
+    const int words_per_thread = (n_words + blockDim.x - 1)/blockDim.x;
+    const int w0 = min(tid*words_per_thread, n_words);
+    const int w1 = min(w0 + words_per_thread, n_words);
+    int n_own = 0;
+    for (int w = w0; w < w1; ++w) {
+        n_own += __popc(bitmap[w]);
+    }
+    thread_offsets[tid] = n_own;
+    __syncthreads();
+    if (tid == 0) {
+        int offset = 0;
+        for (int i = 0; i < (int) blockDim.x; ++i) {
+            const int n = thread_offsets[i];
+            thread_offsets[i] = offset;
+            offset += n;
+        }
+        bitmap[n_words] = offset; // the total, one spare word past the bitmap
+    }
+    __syncthreads();
+
+    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + group)*n_kv_max;
+    int dst = thread_offsets[tid];
+    for (int w = w0; w < w1 && dst < n_kv_max; ++w) {
+        uint32_t bits = bitmap[w];
+        while (bits && dst < n_kv_max) {
+            const int b = __ffs(bits) - 1;
+            bits &= bits - 1;
+            indices[dst++] = w*32 + b;
+        }
+    }
+
+    const int count = min((int) bitmap[n_words], n_kv_max);
+    for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
+        indices[i] = -1;
+    }
+    if (tid == 0) {
+        counts_ptr[int64_t(sequence)*gridDim.x + group] = count;
+    }
+    __syncthreads();
+
+    ggml_cuda_pdl_lc();
+}
+#endif // !defined(GGML_USE_MUSA)
+
+static size_t flash_attn_picks_smem(const int64_t n_kv) {
+    return sizeof(uint32_t)*((n_kv + 31)/32 + 1);
+}
+
+bool ggml_cuda_flash_attn_ext_picks_fit(const int64_t n_kv, const int ncols1) {
+#ifdef GGML_USE_MUSA
+    GGML_UNUSED_VARS(n_kv, ncols1);
+    return false;
+#else
+    return (ncols1 == 1 || ncols1 == 8) && n_kv <= INT32_MAX && flash_attn_picks_smem(n_kv) <= 40*1024;
+#endif // GGML_USE_MUSA
+}
+
+void ggml_cuda_flash_attn_ext_compact_picks(
+        const ggml_tensor * mask, const ggml_tensor * picks, const ggml_tensor * blocks, const ggml_tensor * extra,
+        int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+#ifdef GGML_USE_MUSA
+    GGML_UNUSED_VARS(mask, picks, blocks, extra, indices, counts, n_queries, ncols1, n_kv_max, stream);
+    GGML_ABORT("sparse flash attention is not supported on MUSA");
+#else
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_picks_fit(mask->ne[0], ncols1));
+    GGML_ASSERT(mask->ne[2] == 1 && picks->ne[1] == mask->ne[1] && picks->ne[3] == mask->ne[3]);
+    const int64_t si  = sizeof(int32_t);
+    const int64_t s31 = mask->nb[1] / sizeof(half);
+    const int64_t s33 = mask->nb[3] / sizeof(half);
+    const dim3 blocks_num((n_queries + ncols1 - 1)/ncols1, mask->ne[3], 1);
+    const dim3 block_dim(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, flash_attn_picks_smem(mask->ne[0]), stream);
+    const auto kernel = ncols1 == 1 ? flash_attn_picks_to_sparse_indices<1> : flash_attn_picks_to_sparse_indices<8>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
+        (const half *) mask->data, (const int32_t *) picks->data, (const int32_t *) blocks->data, (const int32_t *) extra->data,
+        indices, counts, int(mask->ne[0]), n_queries, n_kv_max,
+        int(picks->ne[0]), int(blocks->ne[0]), int(blocks->ne[1]), int(extra->ne[0]),
+        s31, s33,
+        picks->nb[0]/si, picks->nb[1]/si, picks->nb[3]/si,
+        blocks->nb[0]/si, blocks->nb[1]/si,
+        extra->nb[0]/si, extra->nb[1]/si, extra->nb[3]/si);
+    CUDA_CHECK(cudaGetLastError());
+#endif // GGML_USE_MUSA
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #ifdef GGML_USE_MUSA
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);

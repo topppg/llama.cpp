@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "top-k-mask.cuh"
 
 #include <cstdint>
 
@@ -777,6 +778,12 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// page select (src[7..9]): the same lists as ggml_cuda_flash_attn_ext_compact_mask for the mask the selection describes
+bool ggml_cuda_flash_attn_ext_picks_fit(int64_t n_kv, int ncols1);
+void ggml_cuda_flash_attn_ext_compact_picks(
+        const ggml_tensor * mask, const ggml_tensor * picks, const ggml_tensor * blocks, const ggml_tensor * extra,
+        int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+
 #define FATTN_PAGED_CHUNK 32
 
 // page-sparse decode: per (sequence, q head) mask row, the ordered list of visible chunks of FATTN_PAGED_CHUNK cells,
@@ -1131,6 +1138,34 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // page select: the sparse MMA path builds its lists from the picks; every other path gets the selection's mask built
+    const ggml_tensor * ps_picks  = KQV->src[7];
+    const ggml_tensor * ps_blocks = KQV->src[8];
+    const ggml_tensor * ps_extra  = KQV->src[9];
+    const bool ps_direct = ps_picks && use_sparse && ggml_cuda_flash_attn_ext_picks_fit(mask->ne[0], ncols1);
+    ggml_tensor ps_mask;
+    ggml_cuda_pool_alloc<half> ps_mask_buf(pool);
+    if (ps_picks && !ps_direct) {
+        GGML_ASSERT(mask && mask->ne[2] == 1 && ps_picks->ne[1] == mask->ne[1] && ps_picks->ne[3] == mask->ne[3]);
+        ps_mask = *mask;
+        ps_mask.op      = GGML_OP_TOP_K_MASK;
+        ps_mask.view_src = nullptr;
+        ps_mask.nb[0]   = sizeof(half);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            ps_mask.nb[i] = ps_mask.nb[i - 1]*ps_mask.ne[i - 1];
+        }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            ps_mask.src[i] = nullptr;
+        }
+        ps_mask.src[0] = const_cast<ggml_tensor *>(mask);
+        ps_mask.src[1] = const_cast<ggml_tensor *>(ps_picks);
+        ps_mask.src[3] = const_cast<ggml_tensor *>(ps_blocks);
+        ps_mask.src[4] = const_cast<ggml_tensor *>(ps_extra);
+        ps_mask.data   = ps_mask_buf.alloc(ggml_nelements(mask));
+        ggml_cuda_op_top_k_mask(ctx, &ps_mask);
+        mask = &ps_mask;
+    }
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1228,7 +1263,12 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (ps_direct) {
+            ggml_cuda_flash_attn_ext_compact_picks(mask, ps_picks, ps_blocks, ps_extra,
+                KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        } else {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // paged (vector kernel, one query): per (sequence, q head) a row [n, chunks...] of n_kv/FATTN_PAGED_CHUNK + 1 ints,
