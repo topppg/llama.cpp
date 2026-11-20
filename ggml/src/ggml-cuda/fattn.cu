@@ -135,7 +135,7 @@ template <int ncols1>
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_picks_to_sparse_indices(
         const half * mask_ptr, const int32_t * picks, const int32_t * blocks, const int32_t * extra,
-        int32_t * indices_ptr, int32_t * counts_ptr,
+        int32_t * indices_ptr, int32_t * counts_ptr, uint32_t * page_flags,
         const int n_kv, const int n_queries, const int n_kv_max,
         const int n_top, const int n_blk, const int n_page, const int n_extra,
         const int64_t s31, const int64_t s33,
@@ -181,6 +181,16 @@ static __global__ void flash_attn_picks_to_sparse_indices(
         }
     }
     __syncthreads();
+
+    // the 64-cell pages this group can read, for the conversion of only those K/V cells (two bitmap words per page)
+    if (page_flags) {
+        const int n_page_flags = (n_kv + 63)/64;
+        for (int w = tid; w < n_words; w += blockDim.x) {
+            if (bitmap[w]) {
+                page_flags[int64_t(sequence)*n_page_flags + w/2] = 1;
+            }
+        }
+    }
 
     // contiguous word ranges per thread, so a prefix sum over the threads keeps the cells in ascending order
     const int words_per_thread = (n_words + blockDim.x - 1)/blockDim.x;
@@ -242,9 +252,9 @@ bool ggml_cuda_flash_attn_ext_picks_fit(const int64_t n_kv, const int ncols1) {
 
 void ggml_cuda_flash_attn_ext_compact_picks(
         const ggml_tensor * mask, const ggml_tensor * picks, const ggml_tensor * blocks, const ggml_tensor * extra,
-        int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
+        int32_t * indices, int32_t * counts, uint32_t * page_flags, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
 #ifdef GGML_USE_MUSA
-    GGML_UNUSED_VARS(mask, picks, blocks, extra, indices, counts, n_queries, ncols1, n_kv_max, stream);
+    GGML_UNUSED_VARS(mask, picks, blocks, extra, indices, counts, page_flags, n_queries, ncols1, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     GGML_ASSERT(ggml_cuda_flash_attn_ext_picks_fit(mask->ne[0], ncols1));
@@ -258,7 +268,7 @@ void ggml_cuda_flash_attn_ext_compact_picks(
     const auto kernel = ncols1 == 1 ? flash_attn_picks_to_sparse_indices<1> : flash_attn_picks_to_sparse_indices<8>;
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, (const int32_t *) picks->data, (const int32_t *) blocks->data, (const int32_t *) extra->data,
-        indices, counts, int(mask->ne[0]), n_queries, n_kv_max,
+        indices, counts, page_flags, int(mask->ne[0]), n_queries, n_kv_max,
         int(picks->ne[0]), int(blocks->ne[0]), int(blocks->ne[1]), int(extra->ne[0]),
         s31, s33,
         picks->nb[0]/si, picks->nb[1]/si, picks->nb[3]/si,
@@ -266,6 +276,76 @@ void ggml_cuda_flash_attn_ext_compact_picks(
         extra->nb[0]/si, extra->nb[1]/si, extra->nb[3]/si);
     CUDA_CHECK(cudaGetLastError());
 #endif // GGML_USE_MUSA
+}
+
+// q8_0 -> f16 of the flagged 64-cell pages (and page 0, which padded list slots read) of every (head, sequence), into the
+// layout of the whole-tensor conversion. hmul: the arithmetic of dequantize_block_q8_0_f16 (half product), otherwise
+// that of dequantize_block<QK8_0, QR8_0, dequantize_q8_0> (float product, then rounded): the values equal the whole
+// conversion's that the launch would otherwise have run.
+template <bool hmul>
+static __global__ void flash_attn_convert_pages_q8_0(
+        const void * __restrict__ vx, half * __restrict__ y, const uint32_t * __restrict__ page_flags, const int64_t n_page,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t p  = blockIdx.x;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i3 = blockIdx.z;
+
+    if (p != 0 && !page_flags[i3*n_page + p]) {
+        return;
+    }
+
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+    const int64_t c0 = 64*p;
+    const int64_t c1 = min(c0 + 64, ne1);
+    const int64_t n_pairs = ne0/2;
+    for (int64_t idx = threadIdx.x; idx < (c1 - c0)*n_pairs; idx += blockDim.x) {
+        const int64_t c   = c0 + idx/n_pairs;
+        const int64_t i00 = 2*(idx % n_pairs);
+        const int64_t ib  = i3*s03 + i2*s02 + c*s01 + i00/QK8_0;
+        const int     iqs = i00 % QK8_0;
+        const int64_t iy0 = ((i3*ne2 + i2)*ne1 + c)*ne0 + i00;
+        if constexpr (hmul) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+            const char2 qs = make_char2(x[ib].qs[iqs + 0], x[ib].qs[iqs + 1]);
+            const half2 r  = __hmul2(make_half2(qs.x, qs.y), __half2half2(x[ib].d));
+            y[iy0 + 0] = __low2half(r);
+            y[iy0 + 1] = __high2half(r);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+        } else {
+            const float d = x[ib].d;
+            float2 v;
+            v.x = x[ib].qs[iqs + 0];
+            v.y = x[ib].qs[iqs + 1];
+            v.x *= d;
+            v.y *= d;
+            y[iy0 + 0] = ggml_cuda_cast<half>(v.x);
+            y[iy0 + 1] = ggml_cuda_cast<half>(v.y);
+        }
+    }
+}
+
+bool ggml_cuda_fa_select_convert_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FA_SELECT_CONVERT");
+        return !e || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+void ggml_cuda_flash_attn_ext_convert_pages(
+        const ggml_tensor * t, half * dst, const uint32_t * page_flags, int64_t n_page, cudaStream_t stream) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 && t->nb[0] == ggml_type_size(t->type) && t->ne[0] % QK8_0 == 0);
+    const int64_t ts  = ggml_type_size(t->type);
+    // the whole conversion takes the half-product kernel for contiguous tensors on fp16 hardware, the generic one otherwise
+    const bool hmul = ggml_is_contiguously_allocated(t) && fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    GGML_ASSERT(t->ne[2] <= 65535 && t->ne[3] <= 65535);
+    const dim3 grid(n_page, t->ne[2], t->ne[3]);
+    const auto kernel = hmul ? flash_attn_convert_pages_q8_0<true> : flash_attn_convert_pages_q8_0<false>;
+    kernel<<<grid, 256, 0, stream>>>(t->data, dst, page_flags, n_page, t->ne[0], t->ne[1], t->ne[2],
+        t->nb[1]/ts, t->nb[2]/ts, t->nb[3]/ts);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {

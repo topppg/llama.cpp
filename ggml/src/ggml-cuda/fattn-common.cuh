@@ -782,7 +782,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 bool ggml_cuda_flash_attn_ext_picks_fit(int64_t n_kv, int ncols1);
 void ggml_cuda_flash_attn_ext_compact_picks(
         const ggml_tensor * mask, const ggml_tensor * picks, const ggml_tensor * blocks, const ggml_tensor * extra,
-        int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+        int32_t * indices, int32_t * counts, uint32_t * page_flags, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+// page select with q8_0 K/V: convert only the 64-cell pages the lists can read (GGML_CUDA_FA_SELECT_CONVERT=0 disables it)
+bool ggml_cuda_fa_select_convert_enabled();
+void ggml_cuda_flash_attn_ext_convert_pages(
+        const ggml_tensor * t, half * dst, const uint32_t * page_flags, int64_t n_page, cudaStream_t stream);
 
 #define FATTN_PAGED_CHUNK 32
 
@@ -1170,6 +1174,45 @@ void launch_fattn(
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
+    bool ps_convert = false;
+    const int64_t ps_n_page = (K->ne[1] + 63)/64;
+    ggml_cuda_pool_alloc<uint32_t> ps_flags(pool);
+
+    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        // rows that share their selection in aligned groups of a multiple of ncols1 have a union of at most n_kv_max_query
+        const int32_t n_rows_shared = ggml_get_op_params_i32(KQV, 6);
+        const bool    union_bound   = ncols1 > 1 && n_rows_shared > 0 && n_rows_shared % ncols1 == 0;
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(union_bound ? 1 : ncols1)*n_kv_max_query);
+
+        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+
+        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        if (ps_direct) {
+            // the kernel reads K/V only at listed cells and at cell 0 (padded slots), as long as no list tile runs past
+            // n_kv_max (the multi-stage K preload does not bound the next tile): then only the listed pages need converting
+            ps_convert = ggml_cuda_fa_select_convert_enabled() && n_kv_max % nbatch_fa == 0 && K->ne[3] == mask->ne[3] &&
+                ((need_f16_K && K->type == GGML_TYPE_Q8_0) || (need_f16_V && V->type == GGML_TYPE_Q8_0 && !V_is_K_view));
+            if (ps_convert) {
+                ps_flags.alloc(size_t(ps_n_page)*mask->ne[3]);
+                CUDA_CHECK(cudaMemsetAsync(ps_flags.ptr, 0, size_t(ps_n_page)*mask->ne[3]*sizeof(uint32_t), main_stream));
+            }
+            ggml_cuda_flash_attn_ext_compact_picks(mask, ps_picks, ps_blocks, ps_extra,
+                KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, ps_convert ? ps_flags.ptr : nullptr, Q->ne[1], ncols1, n_kv_max, main_stream);
+        } else {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
+    }
+
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
     size_t nb12 = K->nb[2];
@@ -1186,7 +1229,13 @@ void launch_fattn(
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
+        if (ps_convert && K->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_convert_pages(K, K_f16, ps_flags.ptr, ps_n_page, main_stream);
+
+            nb11 = K->ne[0] * sizeof(half);
+            nb12 = K->ne[1] * nb11;
+            nb13 = K->ne[2] * nb12;
+        } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
@@ -1220,7 +1269,13 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
+            if (ps_convert && V->type == GGML_TYPE_Q8_0) {
+                ggml_cuda_flash_attn_ext_convert_pages(V, V_f16, ps_flags.ptr, ps_n_page, main_stream);
+
+                nb21 = V->ne[0] * sizeof(half);
+                nb22 = V->ne[1] * nb21;
+                nb23 = V->ne[2] * nb22;
+            } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
@@ -1244,32 +1299,6 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
-    const int gqa_ratio    = Q->ne[2] / K->ne[2];
-    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
-
-    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
-    int32_t n_kv_max = 0;
-    if (use_sparse) {
-        GGML_ASSERT(mask != nullptr);
-        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
-        GGML_ASSERT(n_kv_max_query > 0);
-        // rows that share their selection in aligned groups of a multiple of ncols1 have a union of at most n_kv_max_query
-        const int32_t n_rows_shared = ggml_get_op_params_i32(KQV, 6);
-        const bool    union_bound   = ncols1 > 1 && n_rows_shared > 0 && n_rows_shared % ncols1 == 0;
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(union_bound ? 1 : ncols1)*n_kv_max_query);
-
-        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
-
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        if (ps_direct) {
-            ggml_cuda_flash_attn_ext_compact_picks(mask, ps_picks, ps_blocks, ps_extra,
-                KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
-        } else {
-            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
-        }
-    }
 
     // paged (vector kernel, one query): per (sequence, q head) a row [n, chunks...] of n_kv/FATTN_PAGED_CHUNK + 1 ints,
     // from the op's chunk list (src[6]) or else from the mask
