@@ -1024,7 +1024,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     if constexpr (nstages > 1) {
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
-        // Preload K tile for next iteration:
+        // Preload K tile for next iteration. Not compiled with the sparse gather (above): its tiles are loaded only inside
+        // the iteration that consumes them, bounded by the list (i_sup), so no K/V row outside a list (or cell 0) is read.
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();

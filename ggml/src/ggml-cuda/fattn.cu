@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -326,12 +328,35 @@ static __global__ void flash_attn_convert_pages_q8_0(
     }
 }
 
-bool ggml_cuda_fa_select_convert_enabled() {
-    static const bool enabled = [] {
+int ggml_cuda_fa_select_convert_mode() {
+    static const int mode = [] {
         const char * e = getenv("GGML_CUDA_FA_SELECT_CONVERT");
-        return !e || atoi(e) != 0;
+        const int m = e ? atoi(e) : 1;
+        GGML_ASSERT(m >= 0 && m <= 2 && "GGML_CUDA_FA_SELECT_CONVERT must be 0, 1 or 2");
+        return m;
     }();
-    return enabled;
+    return mode;
+}
+
+// GGML_CUDA_FA_SELECT_LOG=1: at exit, how many page-select attentions with q8_0 K/V converted selectively or whole
+static std::atomic<int64_t> fa_select_n_selective{0};
+static std::atomic<int64_t> fa_select_n_whole{0};
+
+void ggml_cuda_fa_select_count(bool selective) {
+    static const bool log = [] {
+        const char * e = getenv("GGML_CUDA_FA_SELECT_LOG");
+        if (e && atoi(e) != 0) {
+            atexit([] {
+                fprintf(stderr, "ggml_cuda: page select K/V conversion: %lld selective, %lld whole (GGML_CUDA_FA_SELECT_CONVERT=%d)\n",
+                    (long long) fa_select_n_selective.load(), (long long) fa_select_n_whole.load(), ggml_cuda_fa_select_convert_mode());
+            });
+            return true;
+        }
+        return false;
+    }();
+    if (log) {
+        (selective ? fa_select_n_selective : fa_select_n_whole)++;
+    }
 }
 
 void ggml_cuda_flash_attn_ext_convert_pages(

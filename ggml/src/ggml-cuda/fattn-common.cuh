@@ -783,8 +783,11 @@ bool ggml_cuda_flash_attn_ext_picks_fit(int64_t n_kv, int ncols1);
 void ggml_cuda_flash_attn_ext_compact_picks(
         const ggml_tensor * mask, const ggml_tensor * picks, const ggml_tensor * blocks, const ggml_tensor * extra,
         int32_t * indices, int32_t * counts, uint32_t * page_flags, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
-// page select with q8_0 K/V: convert only the 64-cell pages the lists can read (GGML_CUDA_FA_SELECT_CONVERT=0 disables it)
-bool ggml_cuda_fa_select_convert_enabled();
+// page select with q8_0 K/V: convert only the 64-cell pages the lists can read. GGML_CUDA_FA_SELECT_CONVERT: 0 off,
+// 1 (default) only if n_kv_max is a multiple of nbatch_fa, 2 always (the sparse path never loads past a list, see
+// flash_attn_ext_f16_load_tile); ggml_cuda_fa_select_count counts the choices for GGML_CUDA_FA_SELECT_LOG=1
+int  ggml_cuda_fa_select_convert_mode();
+void ggml_cuda_fa_select_count(bool selective);
 void ggml_cuda_flash_attn_ext_convert_pages(
         const ggml_tensor * t, half * dst, const uint32_t * page_flags, int64_t n_page, cudaStream_t stream);
 
@@ -1198,10 +1201,15 @@ void launch_fattn(
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
         if (ps_direct) {
-            // the kernel reads K/V only at listed cells and at cell 0 (padded slots), as long as no list tile runs past
-            // n_kv_max (the multi-stage K preload does not bound the next tile): then only the listed pages need converting
-            ps_convert = ggml_cuda_fa_select_convert_enabled() && n_kv_max % nbatch_fa == 0 && K->ne[3] == mask->ne[3] &&
-                ((need_f16_K && K->type == GGML_TYPE_Q8_0) || (need_f16_V && V->type == GGML_TYPE_Q8_0 && !V_is_K_view));
+            // the sparse kernel reads K/V only at listed cells and at cell 0 (padded slots): every sparse load is bounded by
+            // the list (i_sup), and the unbounded multi-stage preload is compiled out for sparse (static_assert(!use_sparse)),
+            // so only the listed pages need converting. Mode 1 additionally keeps lists tile-aligned, as a conservative default.
+            const int  sc_mode  = ggml_cuda_fa_select_convert_mode();
+            const bool sc_quant = (need_f16_K && K->type == GGML_TYPE_Q8_0) || (need_f16_V && V->type == GGML_TYPE_Q8_0 && !V_is_K_view);
+            ps_convert = sc_quant && K->ne[3] == mask->ne[3] && (sc_mode == 2 || (sc_mode == 1 && n_kv_max % nbatch_fa == 0));
+            if (sc_quant) {
+                ggml_cuda_fa_select_count(ps_convert);
+            }
             if (ps_convert) {
                 ps_flags.alloc(size_t(ps_n_page)*mask->ne[3]);
                 CUDA_CHECK(cudaMemsetAsync(ps_flags.ptr, 0, size_t(ps_n_page)*mask->ne[3]*sizeof(uint32_t), main_stream));
