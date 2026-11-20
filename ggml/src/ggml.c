@@ -5544,6 +5544,26 @@ void ggml_flash_attn_ext_set_chunk_list(
     ggml_set_op_params_i32(a, 5, 32); // listed chunks are whole chunks
 }
 
+void ggml_flash_attn_ext_set_page_select(
+        struct ggml_tensor * a,
+        struct ggml_tensor * picks,
+        struct ggml_tensor * blocks,
+        struct ggml_tensor * extra) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && "page select cannot be combined with kv_rows or a chunk list");
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask && mask->ne[2] == 1);
+    GGML_ASSERT(picks->type == GGML_TYPE_I32 && blocks->type == GGML_TYPE_I32 && extra->type == GGML_TYPE_I32);
+    GGML_ASSERT(picks->ne[1] == mask->ne[1] && picks->ne[2] == 1 && picks->ne[3] == mask->ne[3]);
+    GGML_ASSERT(extra->ne[1] == mask->ne[1] && extra->ne[2] == 1 && extra->ne[3] == mask->ne[3]);
+    GGML_ASSERT(blocks->ne[2] == 1 && blocks->ne[3] == 1);
+    GGML_ASSERT(picks->nb[0] == sizeof(int32_t) && blocks->nb[0] == sizeof(int32_t) && extra->nb[0] == sizeof(int32_t));
+
+    a->src[7] = picks;
+    a->src[8] = blocks;
+    a->src[9] = extra;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

@@ -2295,6 +2295,19 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * list);
 
+    // Page select (block-sparse prefill): the result equals the result with mask replaced by
+    // ggml_top_k_mask(mask, picks, NULL, blocks, extra), without materialising that mask. A cell c is visible to row r
+    // iff mask[r][c] is finite and c is in the block list of a page picked for r, or c is in extra[:, r].
+    // picks:  [n_top, n_rows, 1, n_seq]   i32, pages; values outside [0, n_page) are skipped
+    // blocks: [n_blk, n_page]             i32, the cells of each page; cells outside [0, n_kv) are skipped
+    // extra:  [n_extra, n_rows, 1, n_seq] i32, cells; values outside [0, n_kv) are skipped
+    // n_rows and n_seq as in the mask, whose ne[2] must be 1. Cannot be combined with kv_rows or a chunk list.
+    GGML_API void ggml_flash_attn_ext_set_page_select(
+            struct ggml_tensor * a,
+            struct ggml_tensor * picks,
+            struct ggml_tensor * blocks,
+            struct ggml_tensor * extra);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

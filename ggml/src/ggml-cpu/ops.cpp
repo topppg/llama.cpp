@@ -8871,6 +8871,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
     const ggml_tensor * chunk_list = dst->src[6];
+    // page select (ggml_flash_attn_ext_set_page_select): picks, blocks, extra
+    const ggml_tensor * ps_picks  = dst->src[7];
+    const ggml_tensor * ps_blocks = dst->src[8];
+    const ggml_tensor * ps_extra  = dst->src[9];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8980,6 +8984,35 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int32_t * cl_b = cl ? cl + 1 : nullptr;
         const int32_t * cl_e = cl ? cl + 1 + cl[0] : nullptr;
 
+        // page select: the cells of the picked pages and the extra cells of this row
+        thread_local std::vector<uint8_t> ps_sel;
+        thread_local std::vector<int32_t> ps_set;
+        if (ps_picks) {
+            ps_sel.resize(nek1);
+            const int64_t ps3 = iq3 % ps_picks->ne[3];
+            const int32_t * pr = (const int32_t *) ((const char *) ps_picks->data + iq1*ps_picks->nb[1] + ps3*ps_picks->nb[3]);
+            const int32_t * er = (const int32_t *) ((const char *) ps_extra->data + iq1*ps_extra->nb[1] + ps3*ps_extra->nb[3]);
+            const auto mark = [&](int32_t c) {
+                if (c >= 0 && c < nek1 && !ps_sel[c]) {
+                    ps_sel[c] = 1;
+                    ps_set.push_back(c);
+                }
+            };
+            for (int64_t i = 0; i < ps_picks->ne[0]; ++i) {
+                const int32_t pg = pr[i];
+                if (pg < 0 || pg >= ps_blocks->ne[1]) {
+                    continue;
+                }
+                const int32_t * br = (const int32_t *) ((const char *) ps_blocks->data + pg*ps_blocks->nb[1]);
+                for (int64_t j = 0; j < ps_blocks->ne[0]; ++j) {
+                    mark(br[j]);
+                }
+            }
+            for (int64_t i = 0; i < ps_extra->ne[0]; ++i) {
+                mark(er[i]);
+            }
+        }
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -8990,6 +9023,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 continue;
             }
             if (cl && !std::binary_search(cl_b, cl_e, (int32_t) (ic/32))) {
+                continue;
+            }
+            if (ps_picks && !ps_sel[ic]) {
                 continue;
             }
 
@@ -9043,6 +9079,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             S = S*ms + vs; // scale and increment sum with partial sum
         }
+
+        for (const int32_t c : ps_set) {
+            ps_sel[c] = 0;
+        }
+        ps_set.clear();
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
@@ -9506,7 +9547,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && !kv_rows && !dst->src[7] && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9563,7 +9604,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref && !dst->src[6] &&
+        bool use_tiled = !use_ref && !dst->src[6] && !dst->src[7] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
