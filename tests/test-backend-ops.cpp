@@ -14021,6 +14021,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_page_select(64,  2, 4, 16384, 512, 24, 512, type_KV, materialise));
         }
     }
+    // q8_0 K/V with page select and n_kv_max a multiple of 128 (64*(23 + 1) + 640): the selective conversion of listed pages
+    for (bool materialise : {false, true}) {
+        test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 2, 8, 16384, 512, 23, 512, GGML_TYPE_Q8_0, materialise));
+        test_cases.emplace_back(new test_flash_attn_ext_page_select(256, 4, 6, 32768, 512, 47, 512, GGML_TYPE_Q8_0, materialise));
+    }
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
