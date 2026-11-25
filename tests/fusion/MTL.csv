@@ -59,6 +59,7 @@ deepseek32          ,0   ,any     ,ADD+ADD                     ,      1
 deepseek32          ,0   ,any     ,MUL+ADD                     ,      2
 deepseek32          ,0   ,any     ,NORM+MUL+ADD                ,      2
 deepseek32          ,0   ,any     ,RMS_NORM+MUL                ,      9
+deepseek32          ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      2
 deepseek32          ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
 deepseek4           ,0   ,any     ,MUL+ADD                     ,      8
 deepseek4           ,0   ,any     ,RMS_NORM+MUL                ,     20
@@ -76,6 +77,7 @@ dots3note           ,0   ,any     ,ADD+ADD                     ,      1
 dots3note           ,0   ,any     ,MUL+ADD                     ,      2
 dots3note           ,0   ,any     ,NORM+MUL+ADD                ,      1
 dots3note           ,0   ,any     ,RMS_NORM+MUL                ,     11
+dots3note           ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      1
 dots3note           ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
 dream               ,0   ,any     ,RMS_NORM+MUL                ,      5
 ernie4_5-moe        ,1   ,any     ,ADD+ADD                     ,      1
@@ -108,6 +110,7 @@ glm-dsa             ,0   ,any     ,ADD+ADD                     ,      1
 glm-dsa             ,0   ,any     ,MUL+ADD                     ,      2
 glm-dsa             ,0   ,any     ,NORM+MUL+ADD                ,      2
 glm-dsa             ,0   ,any     ,RMS_NORM+MUL                ,      9
+glm-dsa             ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      2
 glm-dsa             ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
 glm4                ,0   ,any     ,RMS_NORM+MUL                ,      5
 glm4                ,0   ,any     ,RMS_NORM+MUL+ADD            ,      4
@@ -121,6 +124,7 @@ glm5-next           ,0   ,any     ,MUL+ADD                     ,      2
 glm5-next           ,0   ,any     ,NORM+MUL+ADD                ,      1
 glm5-next           ,0   ,any     ,RMS_NORM+MUL                ,      8
 glm5-next           ,0   ,any     ,RMS_NORM+SCALE              ,      2
+glm5-next           ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      1
 glm5-next           ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
 gpt-oss             ,0   ,any     ,MUL+ADD                     ,      4
 gpt-oss             ,0   ,any     ,RMS_NORM+MUL                ,      5
@@ -156,6 +160,7 @@ hy_v3               ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      2
 hy_v4               ,0   ,any     ,MUL+ADD                     ,      2
 hy_v4               ,0   ,any     ,NORM+MUL+ADD                ,      1
 hy_v4               ,0   ,any     ,RMS_NORM+MUL                ,      9
+hy_v4               ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      2
 hy_v4               ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      1
 inkling2            ,0   ,any     ,MUL+ADD                     ,      6
 inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
@@ -179,6 +184,7 @@ kimi-k31            ,0   ,any     ,MUL+ADD                     ,      2
 kimi-k31            ,0   ,any     ,NORM+MUL+ADD                ,      1
 kimi-k31            ,0   ,any     ,RMS_NORM+MUL                ,     17
 kimi-k31            ,0   ,any     ,RMS_NORM+SCALE              ,      2
+kimi-k31            ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      1
 kimi-k31            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
 kimi-linear         ,0   ,any     ,ADD+ADD                     ,      1
 kimi-linear         ,0   ,any     ,GATED_DELTA_NET+CPY         ,      1
@@ -247,6 +253,7 @@ mistral-large4      ,0   ,any     ,ADD+ADD                     ,      3
 mistral-large4      ,0   ,any     ,MUL+ADD                     ,      6
 mistral-large4      ,0   ,any     ,NORM+MUL+ADD                ,      6
 mistral-large4      ,0   ,any     ,RMS_NORM+MUL                ,     12
+mistral-large4      ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      4
 mistral3            ,0   ,any     ,RMS_NORM+MUL                ,      5
 mistral3            ,0   ,any     ,MUL+ADD                     ,      4
 mistral3            ,0   ,any     ,RMS_NORM+MUL                ,      5
@@ -331,6 +338,7 @@ qwen4exp            ,0   ,any     ,RMS_NORM+MUL                ,     13
 qwen4exp            ,0   ,any     ,RMS_NORM+SCALE              ,      2
 qwen4exp            ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 qwen4exp            ,0   ,any     ,SSM_CONV+UNARY              ,      1
+qwen4exp            ,0   ,any     ,TOP_K_MASK+FLASH_ATTN_EXT   ,      1
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 refact              ,0   ,any     ,RMS_NORM+MUL                ,      5
 ricursive           ,0   ,any     ,RMS_NORM+MUL                ,      9

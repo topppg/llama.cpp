@@ -358,6 +358,342 @@ kernel void kernel_flash_attn_ext_vec_idx(
     }
 }
 
+constant bool FC_flash_attn_ext_vec_idx_tkm_has_score  [[function_constant(FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 0)]];
+constant bool FC_flash_attn_ext_vec_idx_tkm_has_blocks [[function_constant(FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 1)]];
+constant bool FC_flash_attn_ext_vec_idx_tkm_has_extra  [[function_constant(FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 2)]];
+
+// build the sparse FA index list directly from top_k_mask inputs
+kernel void kernel_flash_attn_ext_vec_idx_top_k_mask(
+        constant ggml_metal_kargs_flash_attn_ext_vec_idx_top_k_mask & args,
+        device const half * mask,
+        device const char * top_k,
+        device const char * score,
+        device const char * blocks,
+        device const char * extra,
+        device       int  * idx,
+        threadgroup  uint * s_idx [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    constexpr short NW     = N_SIMDWIDTH;
+    constexpr short NLOCAL = 16;
+
+    const int f1 = tgpig[0];
+    const int f2 = tgpig[1];
+    const int f3 = tgpig[2];
+
+    const int64_t row = ((int64_t) f3 * args.fa_ne2 + f2) * args.fa_ne1 + f1;
+    device int * pidx = idx + row * args.n_kv_max_padded;
+
+    const int n_top_cells = FC_flash_attn_ext_vec_idx_tkm_has_blocks ? args.n_top * args.n_blk : args.n_top;
+    const int n_cand      = n_top_cells + args.n_extra;
+
+    if (n_cand == 0) {
+        for (int i = tiitg; i < args.n_kv_max_padded; i += ntg.x) {
+            pidx[i] = -1;
+        }
+        return;
+    }
+
+    const int64_t i1 = row % args.tkm_ne1;
+    const int64_t r1 = row / args.tkm_ne1;
+    const int64_t i2 = r1 % args.tkm_ne2;
+    const int64_t i3 = r1 / args.tkm_ne2;
+
+    device const half * mask_row  = (device const half *) ((device const char *) mask + (i1 % args.m1)*args.nbm1 + (i2 % args.m2)*args.nbm2 + (i3 % args.m3)*args.nbm3);
+    device const char * top_k_row = top_k + i1*args.nbk1 + i2*args.nbk2 + i3*args.nbk3;
+    device const char * score_row = score + i1*args.nbs1 + i2*args.nbs2 + i3*args.nbs3;
+    device const char * extra_row = extra + i1*args.nbe1 + i2*args.nbe2 + i3*args.nbe3;
+
+    // keep small extra lists out of the main sort so P does not double for a short tail
+    const bool split_extra = FC_flash_attn_ext_vec_idx_tkm_has_extra && args.split_extra != 0;
+    const int  n_main      = split_extra ? n_top_cells : n_cand;
+    const int  P           = args.sort_n;
+
+    // 0xFFFFFFFFu never collides with a non-negative int32_t KV index
+    for (int i = tiitg; i < args.n_top; i += ntg.x) {
+        const int32_t p = *(device const int32_t *) (top_k_row + (int64_t) i*args.nbk0);
+        const bool pick_ok = (p >= 0 && p < args.n_pick) &&
+            (!FC_flash_attn_ext_vec_idx_tkm_has_score ||
+             (*(device const float *) (score_row + (int64_t) p*args.nbs0) > -INFINITY));
+
+        if (FC_flash_attn_ext_vec_idx_tkm_has_blocks) {
+            const int base_slot = i * args.n_blk;
+            if (pick_ok) {
+                for (int k = 0; k < args.n_blk; ++k) {
+                    const int32_t c = *(device const int32_t *) (blocks + (int64_t) k*args.nbb0 + (int64_t) p*args.nbb1);
+                    s_idx[base_slot + k] = (c >= 0 && c < args.n_kv && isfinite((float) mask_row[c])) ? (uint) c : 0xFFFFFFFFu;
+                }
+            } else {
+                for (int k = 0; k < args.n_blk; ++k) {
+                    s_idx[base_slot + k] = 0xFFFFFFFFu;
+                }
+            }
+        } else {
+            s_idx[i] = (pick_ok && p < args.n_kv && isfinite((float) mask_row[p])) ? (uint) p : 0xFFFFFFFFu;
+        }
+    }
+
+    threadgroup uint s_ext[OP_FLASH_ATTN_EXT_VEC_IDX_TKM_SPLIT_EXTRA_MAX];
+    threadgroup int  ext_rank[OP_FLASH_ATTN_EXT_VEC_IDX_TKM_SPLIT_EXTRA_MAX];
+    threadgroup int  tg_n_ext;
+
+    if (FC_flash_attn_ext_vec_idx_tkm_has_extra) {
+        if (split_extra) {
+            if (tiitg < NW) {
+                uint ev = 0xFFFFFFFFu;
+                if (tiitg < args.n_extra) {
+                    const int32_t c = *(device const int32_t *) (extra_row + (int64_t) tiitg*args.nbe0);
+                    if (c >= 0 && c < args.n_kv && isfinite((float) mask_row[c])) {
+                        ev = (uint) c;
+                    }
+                }
+                for (int k = 2; k <= NW; k <<= 1) {
+                    const bool want_asc = (tiitg & k) == 0;
+                    for (int j = k >> 1; j > 0; j >>= 1) {
+                        const uint other = simd_shuffle_xor(ev, (ushort) j);
+                        const bool is_hi = (tiitg & j) != 0;
+                        ev = (is_hi == want_asc) ? max(ev, other) : min(ev, other);
+                    }
+                }
+                const uint prev_ev = simd_shuffle_up(ev, 1);
+                const int is_uniq = (ev != 0xFFFFFFFFu && (tiitg == 0 || ev != prev_ev)) ? 1 : 0;
+                int incl_e = is_uniq;
+                for (int d = 1; d < NW; d <<= 1) {
+                    const int v = simd_shuffle_up(incl_e, d);
+                    if (tiitg >= d) {
+                        incl_e += v;
+                    }
+                }
+                if (is_uniq) {
+                    s_ext[incl_e - 1] = ev;
+                }
+                if (tiitg == NW - 1) {
+                    tg_n_ext = incl_e;
+                }
+            }
+        } else {
+            for (int i = tiitg; i < args.n_extra; i += ntg.x) {
+                const int32_t c = *(device const int32_t *) (extra_row + (int64_t) i*args.nbe0);
+                s_idx[n_top_cells + i] = (c >= 0 && c < args.n_kv && isfinite((float) mask_row[c])) ? (uint) c : 0xFFFFFFFFu;
+            }
+        }
+    }
+
+    for (int i = n_main + tiitg; i < P; i += ntg.x) {
+        s_idx[i] = 0xFFFFFFFFu;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short sgitg = tiitg / NW;
+    const short tiisg = tiitg % NW;
+    const short nsg   = ntg.x / NW;
+
+    if (P > 1) {
+        const int n_blk32 = max(1, P / NW);
+
+        for (int b = sgitg; b < n_blk32; b += nsg) {
+            const int gidx = b * NW + tiisg;
+            uint v = (gidx < P) ? s_idx[gidx] : 0xFFFFFFFFu;
+
+            for (int k = 2; k <= min(P, (int) NW); k <<= 1) {
+                const bool want_asc = (gidx & k) == 0;
+                for (int j = k >> 1; j > 0; j >>= 1) {
+                    const uint other = simd_shuffle_xor(v, (ushort) j);
+                    const bool is_hi = (tiisg & j) != 0;
+                    v = (is_hi == want_asc) ? max(v, other) : min(v, other);
+                }
+            }
+
+            if (gidx < P) {
+                s_idx[gidx] = v;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int k = NW << 1; k <= P; k <<= 1) {
+            for (int j = k >> 1; j >= NW; j >>= 1) {
+                for (int p = tiitg; p < (P >> 1); p += ntg.x) {
+                    const int lo = ((p & ~(j - 1)) << 1) | (p & (j - 1));
+                    const int hi = lo + j;
+                    const bool asc = (lo & k) == 0;
+                    const uint a  = s_idx[lo];
+                    const uint bv = s_idx[hi];
+                    if (asc ? (a > bv) : (a < bv)) {
+                        s_idx[lo] = bv;
+                        s_idx[hi] = a;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (int b = sgitg; b < n_blk32; b += nsg) {
+                const int gidx = b * NW + tiisg;
+                uint v = s_idx[gidx];
+                const bool want_asc = (gidx & k) == 0;
+
+                for (int j = NW >> 1; j > 0; j >>= 1) {
+                    const uint other = simd_shuffle_xor(v, (ushort) j);
+                    const bool is_hi = (tiisg & j) != 0;
+                    v = (is_hi == want_asc) ? max(v, other) : min(v, other);
+                }
+
+                s_idx[gidx] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const int q  = n_main / ntg.x;
+    const int r  = n_main % ntg.x;
+    const int r0 = q * tiitg + min((int) tiitg, r);
+    const int r1_slice = r0 + q + (tiitg < r ? 1 : 0);
+
+    int cnt  = 0;
+    int nloc = 0;
+    int local[NLOCAL];
+    for (int i = r0; i < r1_slice; ++i) {
+        const uint v = s_idx[i];
+        if (v == 0xFFFFFFFFu) {
+            break;
+        }
+        if (i == 0 || v != s_idx[i - 1]) {
+            if (nloc < NLOCAL) {
+                local[nloc] = (int) v;
+                nloc++;
+            }
+            cnt++;
+        }
+    }
+
+    threadgroup int tcount[32];
+
+    const int sg_sum = simd_sum(cnt);
+    if (tiisg == 0) {
+        tcount[sgitg] = sg_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int total = 0;
+    for (short s = 0; s < nsg; ++s) {
+        total += tcount[s];
+    }
+
+    int sg_base = 0;
+    for (short s = 0; s < sgitg; ++s) {
+        sg_base += tcount[s];
+    }
+
+    int incl = cnt;
+    for (int d = 1; d < NW; d <<= 1) {
+        const int v = simd_shuffle_up(incl, d);
+        if (tiisg >= d) {
+            incl += v;
+        }
+    }
+    const int base = sg_base + (incl - cnt);
+
+    int n_ext_m = 0;
+    if (split_extra && tg_n_ext > 0) {
+        const int n_ext_u = tg_n_ext;
+        if (tiitg < n_ext_u) {
+            ext_rank[tiitg] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // each unique element owns the disjoint interval (prev_v, v], so at most one thread writes ext_rank[e]
+        int j_e = 0;
+        for (int i = r0; i < r1_slice; ++i) {
+            const uint v = s_idx[i];
+            if (v == 0xFFFFFFFFu) {
+                break;
+            }
+            if (i == 0 || v != s_idx[i - 1]) {
+                const int pos = base + j_e;
+                const uint prev_v = i > 0 ? s_idx[i - 1] : 0u;
+                for (int e = 0; e < n_ext_u; ++e) {
+                    const uint ev = s_ext[e];
+                    if (ev == v) {
+                        ext_rank[e] = -1;
+                    } else if (ev < v && (pos == 0 || prev_v < ev)) {
+                        ext_rank[e] = pos;
+                    }
+                }
+                j_e++;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiitg == 0) {
+            int m = 0;
+            for (int e = 0; e < n_ext_u; ++e) {
+                if (ext_rank[e] >= 0) {
+                    s_ext[m]    = s_ext[e];
+                    ext_rank[m] = ext_rank[e];
+                    m++;
+                }
+            }
+            tg_n_ext = m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        n_ext_m = tg_n_ext;
+    }
+
+    int j = 0;
+    for (; j < nloc; ++j) {
+        const uint v = (uint) local[j];
+        int shift = 0;
+        while (shift < n_ext_m && s_ext[shift] < v) {
+            shift++;
+        }
+        const int out_pos = base + j + shift;
+        if (out_pos >= args.n_kv_max) {
+            break;
+        }
+        pidx[out_pos] = (int) v;
+    }
+
+    // fallback only reachable if the pipeline caps threads per threadgroup below 256
+    if (cnt > nloc) {
+        int j2 = 0;
+        for (int i = r0; i < r1_slice; ++i) {
+            const uint v = s_idx[i];
+            if (v == 0xFFFFFFFFu) {
+                break;
+            }
+            if (i == 0 || v != s_idx[i - 1]) {
+                if (j2 >= nloc) {
+                    int shift = 0;
+                    while (shift < n_ext_m && s_ext[shift] < v) {
+                        shift++;
+                    }
+                    const int out_pos = base + j2 + shift;
+                    if (out_pos >= args.n_kv_max) {
+                        break;
+                    }
+                    pidx[out_pos] = (int) v;
+                }
+                j2++;
+            }
+        }
+    }
+
+    if (tiitg < n_ext_m) {
+        const int out_pos = ext_rank[tiitg] + tiitg;
+        if (out_pos < args.n_kv_max) {
+            pidx[out_pos] = (int) s_ext[tiitg];
+        }
+    }
+
+    const int out_count = min(total + n_ext_m, args.n_kv_max);
+    for (int i = out_count + tiitg; i < args.n_kv_max_padded; i += ntg.x) {
+        pidx[i] = -1;
+    }
+}
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 

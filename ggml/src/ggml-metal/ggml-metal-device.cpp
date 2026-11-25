@@ -2064,6 +2064,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_top_k_mask(
+        ggml_metal_library_t lib,
+        bool    has_score,
+        bool    has_blocks,
+        bool    has_extra) {
+    const char * base = "kernel_flash_attn_ext_vec_idx_top_k_mask";
+    char name[256];
+
+    snprintf(name, 256, "%s_sc=%d_bl=%d_ex=%d", base, has_score ? 1 : 0, has_blocks ? 1 : 0, has_extra ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, has_score,  FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 0);
+        ggml_metal_cv_set_bool(cv, has_blocks, FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 1);
+        ggml_metal_cv_set_bool(cv, has_extra,  FC_FLASH_ATTN_EXT_VEC_IDX_TKM + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
         const ggml_tensor * op,

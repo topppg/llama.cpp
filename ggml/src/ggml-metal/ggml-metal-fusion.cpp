@@ -2,6 +2,8 @@
 
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
+#include "ggml-metal-impl.h"
+#include "ggml-metal-ops.h"
 
 #include "ggml-backend-impl.h"
 
@@ -811,6 +813,264 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+bool ggml_metal_top_k_mask_fa_mask_strides(
+        const ggml_tensor * base_mask,
+        const ggml_tensor * tkm,
+        const ggml_tensor * fa_mask,
+        uint64_t * nb31_out,
+        uint64_t * nb32_out,
+        uint64_t * nb33_out) {
+    if (!base_mask || !tkm || !fa_mask) {
+        return false;
+    }
+
+    if (base_mask->type != GGML_TYPE_F16 || base_mask->ne[0] != fa_mask->ne[0] ||
+        base_mask->nb[0] != ggml_type_size(GGML_TYPE_F16) ||
+        base_mask->view_offs % sizeof(ggml_fp16_t) != 0 ||
+        base_mask->nb[1] % sizeof(ggml_fp16_t) != 0 ||
+        base_mask->nb[2] % sizeof(ggml_fp16_t) != 0 ||
+        base_mask->nb[3] % sizeof(ggml_fp16_t) != 0) {
+        return false;
+    }
+
+    const int64_t m1 = base_mask->ne[1];
+    const int64_t m2 = base_mask->ne[2];
+    const int64_t m3 = base_mask->ne[3];
+
+    if (m1 == 1 && m2 == 1 && m3 == 1) {
+        *nb31_out = 0;
+        *nb32_out = 0;
+        *nb33_out = 0;
+        return true;
+    }
+
+    if (fa_mask->ne[1] == tkm->ne[1] && fa_mask->ne[2] == tkm->ne[2] && fa_mask->ne[3] == tkm->ne[3]) {
+        if ((m1 != 1 && m1 != fa_mask->ne[1]) ||
+            (m2 != 1 && m2 != fa_mask->ne[2]) ||
+            (m3 != 1 && m3 != fa_mask->ne[3])) {
+            return false;
+        }
+        *nb31_out = m1 == 1 ? 0 : base_mask->nb[1];
+        *nb32_out = m2 == 1 ? 0 : base_mask->nb[2];
+        *nb33_out = m3 == 1 ? 0 : base_mask->nb[3];
+        return true;
+    }
+
+    // shape-changing reshape requires base_mask rows to be linear with stride nb[1]
+    if (m1 == tkm->ne[1] && m2 == tkm->ne[2] && m3 == tkm->ne[3] &&
+        base_mask->nb[2] == (uint64_t) m1 * base_mask->nb[1] &&
+        base_mask->nb[3] == (uint64_t) m2 * base_mask->nb[2]) {
+        *nb31_out = base_mask->nb[1];
+        *nb32_out = (uint64_t) fa_mask->ne[1] * base_mask->nb[1];
+        *nb33_out = (uint64_t) fa_mask->ne[2] * (*nb32_out);
+        return true;
+    }
+
+    return false;
+}
+
+static bool ggml_metal_fusion_alloc_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b || !a->data || !b->data) {
+        return false;
+    }
+
+    const ggml_tensor * ba = a->view_src ? a->view_src : a;
+    const ggml_tensor * bb = b->view_src ? b->view_src : b;
+    if (!ba->buffer || !bb->buffer) {
+        return false;
+    }
+
+    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->buffer->context, ba);
+    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->buffer->context, bb);
+    if (bid_a.metal == nullptr || bid_a.metal != bid_b.metal) {
+        return false;
+    }
+
+    const size_t size_a = ggml_backend_buft_get_alloc_size(ba->buffer->buft, ba);
+    const size_t size_b = ggml_backend_buft_get_alloc_size(bb->buffer->buft, bb);
+    if (size_a == 0 || size_b == 0) {
+        return false;
+    }
+
+    return bid_a.offs <= bid_b.offs
+        ? bid_b.offs - bid_a.offs < size_a
+        : bid_a.offs - bid_b.offs < size_b;
+}
+
+static bool ggml_metal_tensor_aligned_4(const ggml_tensor * t) {
+    return t->view_offs % 4 == 0 &&
+        t->nb[0] % 4 == 0 && t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0 && t->nb[3] % 4 == 0;
+}
+
+// TOP_K_MASK + [RESHAPE...] + sparse FLASH_ATTN_EXT
+static bool ggml_metal_fusion_check_top_k_mask_fa(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(nodes);
+
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + 1];
+    const int raw_count = raw_end - raw_start + 1;
+
+    if (raw_count < 2 || raw_count > GGML_METAL_FUSION_MAX) {
+        return false;
+    }
+
+    int     raw_idxs[GGML_METAL_FUSION_MAX];
+    ggml_op raw_ops [GGML_METAL_FUSION_MAX];
+
+    const ggml_tensor * tkm = gf->nodes[raw_start];
+    const ggml_tensor * fa  = gf->nodes[raw_end];
+
+    if (tkm->op != GGML_OP_TOP_K_MASK || fa->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+
+    raw_idxs[0] = raw_start;
+    raw_ops [0] = GGML_OP_TOP_K_MASK;
+
+    if (!ggml_is_contiguous(tkm)) {
+        return false;
+    }
+
+    const int64_t tkm_nelems = ggml_nelements(tkm);
+    const ggml_tensor * prev = tkm;
+    for (int i = 1; i < raw_count - 1; ++i) {
+        const ggml_tensor * r = gf->nodes[raw_start + i];
+        if (r->op != GGML_OP_RESHAPE || r->src[0] != prev || r->view_offs != 0 ||
+            r->ne[0] != tkm->ne[0] || !ggml_is_contiguous(r) || ggml_nelements(r) != tkm_nelems) {
+            return false;
+        }
+        raw_idxs[i] = raw_start + i;
+        raw_ops [i] = GGML_OP_RESHAPE;
+        prev = r;
+    }
+
+    raw_idxs[raw_count - 1] = raw_end;
+    raw_ops [raw_count - 1] = GGML_OP_FLASH_ATTN_EXT;
+
+    const ggml_tensor * fa_mask = prev;
+    if (fa->src[3] != fa_mask) {
+        return false;
+    }
+
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (s == 3 || !fa->src[s]) {
+            continue;
+        }
+        for (int i = 0; i < raw_count - 1; ++i) {
+            if (fa->src[s] == gf->nodes[raw_start + i]) {
+                return false;
+            }
+        }
+    }
+
+    const int outputs[1] = { raw_end };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, raw_ops, outputs, 1)) {
+        return false;
+    }
+
+    if (ggml_metal_op_flash_attn_ext_n_kv_max_sparse(fa) <= 0) {
+        return false;
+    }
+
+    if (tkm->type != GGML_TYPE_F16 || fa_mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const ggml_tensor * base_mask = tkm->src[0];
+    const ggml_tensor * top_k     = tkm->src[1];
+    const ggml_tensor * score     = tkm->src[2];
+    const ggml_tensor * blocks    = tkm->src[3];
+    const ggml_tensor * extra     = tkm->src[4];
+
+    if (!base_mask || !top_k ||
+        top_k->type != GGML_TYPE_I32 || !ggml_metal_tensor_aligned_4(top_k) ||
+        (score  && (score->type  != GGML_TYPE_F32 || !ggml_metal_tensor_aligned_4(score))) ||
+        (blocks && (blocks->type != GGML_TYPE_I32 || !ggml_metal_tensor_aligned_4(blocks))) ||
+        (extra  && (extra->type  != GGML_TYPE_I32 || !ggml_metal_tensor_aligned_4(extra)))) {
+        return false;
+    }
+
+    if (tkm->ne[0] != base_mask->ne[0] ||
+        fa_mask->ne[0] != fa->src[1]->ne[1] || fa_mask->ne[1] < fa->src[0]->ne[1]) {
+        return false;
+    }
+
+    if (base_mask->ne[1] <= 0 || base_mask->ne[2] <= 0 || base_mask->ne[3] <= 0 ||
+        base_mask->ne[1] > INT32_MAX || base_mask->ne[2] > INT32_MAX || base_mask->ne[3] > INT32_MAX ||
+        tkm->ne[1] % base_mask->ne[1] != 0 || tkm->ne[2] % base_mask->ne[2] != 0 || tkm->ne[3] % base_mask->ne[3] != 0) {
+        return false;
+    }
+
+    if (top_k->ne[1] != tkm->ne[1] || top_k->ne[2] != tkm->ne[2] || top_k->ne[3] != tkm->ne[3]) {
+        return false;
+    }
+
+    const int64_t n_top   = top_k->ne[0];
+    const int64_t n_blk   = blocks ? blocks->ne[0] : 1;
+    const int64_t n_extra = extra  ? extra->ne[0]  : 0;
+    const int64_t n_pick  = blocks ? blocks->ne[1] : score ? score->ne[0] : base_mask->ne[0];
+
+    if (score && (score->ne[0] < n_pick || score->ne[1] != tkm->ne[1] || score->ne[2] != tkm->ne[2] || score->ne[3] != tkm->ne[3])) {
+        return false;
+    }
+    if (blocks && (blocks->ne[2] != 1 || blocks->ne[3] != 1)) {
+        return false;
+    }
+    if (extra && (extra->ne[1] != tkm->ne[1] || extra->ne[2] != tkm->ne[2] || extra->ne[3] != tkm->ne[3])) {
+        return false;
+    }
+
+    if (n_top < 0 || n_blk <= 0 || n_extra < 0 || n_pick < 0 ||
+        n_top > OP_FLASH_ATTN_EXT_VEC_IDX_TKM_MAX_CAND ||
+        n_blk > OP_FLASH_ATTN_EXT_VEC_IDX_TKM_MAX_CAND ||
+        n_extra > OP_FLASH_ATTN_EXT_VEC_IDX_TKM_MAX_CAND ||
+        n_pick > INT32_MAX || base_mask->ne[0] > INT32_MAX ||
+        tkm->ne[1] > INT32_MAX || tkm->ne[2] > INT32_MAX || tkm->ne[3] > INT32_MAX ||
+        fa_mask->ne[1] > INT32_MAX || fa_mask->ne[2] > INT32_MAX || fa_mask->ne[3] > INT32_MAX) {
+        return false;
+    }
+
+    if (n_top * n_blk + n_extra > OP_FLASH_ATTN_EXT_VEC_IDX_TKM_MAX_CAND) {
+        return false;
+    }
+
+    uint64_t nb31 = 0, nb32 = 0, nb33 = 0;
+    if (!ggml_metal_top_k_mask_fa_mask_strides(base_mask, tkm, fa_mask, &nb31, &nb32, &nb33)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!base_mask->data || !fa->data ||
+            (n_top > 0 && !top_k->data) ||
+            (score && !score->data) || (blocks && !blocks->data) || (extra && !extra->data)) {
+            return false;
+        }
+
+        if (tkm->ne[0] <= 0 || tkm->ne[1] <= 0 || tkm->ne[2] <= 0 || tkm->ne[3] <= 0) {
+            return false;
+        }
+
+        // fa writes both its output and scratch (including bid_idx), so inputs must not overlap fa
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (ggml_metal_fusion_alloc_overlap(fa, tkm->src[s])) {
+                return false;
+            }
+            if (s != 3 && ggml_metal_fusion_alloc_overlap(fa, fa->src[s])) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -862,6 +1122,8 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_top_k_mask_fa = { GGML_OP_TOP_K_MASK, GGML_OP_FLASH_ATTN_EXT };
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,     ops_norm_mul,         {}, false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD, ops_norm_mul_add,     {}, false, ggml_metal_fusion_check_norm },
@@ -911,36 +1173,53 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
+
+    { GGML_METAL_FUSION_TOP_K_MASK_FA, ops_top_k_mask_fa, {}, true, ggml_metal_fusion_check_top_k_mask_fa },
 };
 
 // ---- alloc deps -----------------------------------------------------------
 
-static bool ggml_metal_fusion_match_raw_pattern(
-        const ggml_cgraph * gf, int node_idx, const std::vector<ggml_op> & ops) {
+static int ggml_metal_fusion_match_raw_pattern(
+        const ggml_cgraph * gf, int node_idx, const ggml_metal_fusion & fusion) {
+    if (fusion.id == GGML_METAL_FUSION_TOP_K_MASK_FA) {
+        if (node_idx < 0 || node_idx + 1 >= gf->n_nodes || gf->nodes[node_idx]->op != GGML_OP_TOP_K_MASK) {
+            return 0;
+        }
+        int j = node_idx + 1;
+        while (j < gf->n_nodes && j - node_idx + 1 < GGML_METAL_FUSION_MAX && gf->nodes[j]->op == GGML_OP_RESHAPE) {
+            ++j;
+        }
+        if (j < gf->n_nodes && gf->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT) {
+            return j - node_idx + 1;
+        }
+        return 0;
+    }
+
+    const std::vector<ggml_op> & ops = fusion.ops_all;
     if (node_idx < 0 || node_idx + (int) ops.size() > gf->n_nodes) {
-        return false;
+        return 0;
     }
 
     for (int i = 0; i < (int) ops.size(); ++i) {
         if (gf->nodes[node_idx + i]->op != ops[i]) {
-            return false;
+            return 0;
         }
     }
 
-    return true;
+    return (int) ops.size();
 }
 
 static void ggml_metal_fusion_add_pattern_alloc_deps(
         void * user_data,
         void (*add_alloc_dep)(void *, ggml_tensor *, ggml_tensor *),
         ggml_cgraph * gf,
-        const ggml_metal_fusion * fusion,
-        int node_idx) {
-    const int last_node = node_idx + (int) fusion->ops_all.size() - 1;
+        int node_idx,
+        int raw_count) {
+    const int last_node = node_idx + raw_count - 1;
 
     // keep all external inputs alive until the fused output
     std::set<ggml_tensor *> seen;
-    for (int j = 0; j < (int) fusion->ops_all.size(); ++j) {
+    for (int j = 0; j < raw_count; ++j) {
         ggml_tensor * node = gf->nodes[node_idx + j];
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             ggml_tensor * src = node->src[s];
@@ -957,21 +1236,17 @@ void ggml_metal_fusion_add_alloc_deps(
         void (*add_alloc_dep)(void *, ggml_tensor *, ggml_tensor *),
         ggml_cgraph * gf) {
     for (int i = 0; i < gf->n_nodes; ++i) {
-        const ggml_metal_fusion * best = nullptr;
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
-            if ((int) fusion.ops_all.size() <= best_raw) {
-                continue;
-            }
-            if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
-                best = &fusion;
-                best_raw = (int) fusion.ops_all.size();
+            const int raw_count = ggml_metal_fusion_match_raw_pattern(gf, i, fusion);
+            if (raw_count > best_raw) {
+                best_raw = raw_count;
             }
         }
 
-        if (best) {
-            ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, best, i);
+        if (best_raw > 0) {
+            ggml_metal_fusion_add_pattern_alloc_deps(user_data, add_alloc_dep, gf, i, best_raw);
             i += best_raw - 1;
         }
     }

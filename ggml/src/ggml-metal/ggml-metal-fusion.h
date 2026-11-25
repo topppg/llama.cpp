@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_TOP_K_MASK_FA, // TOP_K_MASK + [RESHAPE +] sparse FLASH_ATTN_EXT
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
@@ -57,6 +58,15 @@ void ggml_metal_fusion_add_alloc_deps(
         void * user_data,
         void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *),
         struct ggml_cgraph * gf);
+
+// compute effective mask strides for reading base_mask directly in fused TOP_K_MASK + sparse FLASH_ATTN_EXT
+bool ggml_metal_top_k_mask_fa_mask_strides(
+        const struct ggml_tensor * base_mask,
+        const struct ggml_tensor * tkm,
+        const struct ggml_tensor * fa_mask,
+        uint64_t * nb31_out,
+        uint64_t * nb32_out,
+        uint64_t * nb33_out);
 
 // ---- shared fusion info ---------------------------------------------------
 

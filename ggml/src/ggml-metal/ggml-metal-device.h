@@ -229,6 +229,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_top_k_mask(
+        ggml_metal_library_t lib,
+        bool    has_score,
+        bool    has_blocks,
+        bool    has_extra);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
